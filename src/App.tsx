@@ -861,33 +861,31 @@ export default function App() {
                                   <ArrowRight className="size-4" />
                                 </Button>
                               </DialogTrigger>
-                              <DialogContent className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden rounded-[28px] border-border/70 p-0">
-                                <DialogHeader className="shrink-0 border-b border-border/70 px-6 py-5 text-left">
+                              <DialogContent className="max-h-[85vh] w-full max-w-3xl sm:max-w-3xl overflow-y-auto rounded-[28px] border-border/70 p-0">
+                                <DialogHeader className="border-b border-border/70 px-6 py-5 text-left">
                                   <DialogTitle className="text-xl tracking-tight">{clip.title}</DialogTitle>
                                   <DialogDescription>
                                     {videoMeta?.title ?? "YouTube clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
                                   </DialogDescription>
                                 </DialogHeader>
-                                <div className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
-                                    <div className="w-full shrink-0 bg-black lg:flex lg:h-full lg:w-[60%] lg:items-center lg:justify-center lg:p-6">
-                                      <div className="relative w-full overflow-hidden lg:aspect-video lg:h-auto lg:max-h-full lg:rounded-xl" style={{ aspectRatio: "16 / 9" }}>
+                                <div>
+                                    <div className="aspect-video w-full bg-black">
                                         {currentVideoId ? (
                                           <iframe
                                             key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}`}
                                             src={getClipEmbedUrl(currentVideoId, clip)}
                                             title={clip.title}
-                                            className="absolute inset-0 h-full w-full"
+                                            className="h-full w-full"
                                             loading="lazy"
                                             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                                             referrerPolicy="strict-origin-when-cross-origin"
                                             allowFullScreen
                                           />
                                         ) : (
-                                          <div className="absolute inset-0 flex items-center justify-center text-white/70">Preview unavailable</div>
+                                          <div className="flex h-full w-full items-center justify-center text-white/70">Preview unavailable</div>
                                         )}
-                                      </div>
                                     </div>
-                                    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-background lg:h-full lg:w-[40%]">
+                                    <div className="bg-background">
                                       <div className="space-y-4 px-6 py-5">
                                         <div>
                                           <p className="text-sm font-medium text-muted-foreground">Why AI picked this</p>
@@ -919,7 +917,7 @@ export default function App() {
                                           This preview now uses a real YouTube embed with exact `start` and `end` parameters, so the review flow is working instead of being a dead button.
                                         </div>
                                       </div>
-                                      <div className="sticky bottom-0 border-t border-border/70 bg-background/95 px-6 py-4 backdrop-blur supports-[backdrop-filter]:bg-background/85">
+                                      <div className="border-t border-border/70 bg-background/95 px-6 py-4">
                                         <div className="flex flex-col gap-3 sm:flex-row">
                                           <Button
                                             className="h-11 flex-1 rounded-2xl"
