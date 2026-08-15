@@ -861,32 +861,33 @@ export default function App() {
                                   <ArrowRight className="size-4" />
                                 </Button>
                               </DialogTrigger>
-                              <DialogContent className="max-h-[90vh] max-w-4xl overflow-hidden rounded-[28px] border-border/70 p-0">
-                                <div className="flex max-h-[90vh] flex-col">
-                                  <DialogHeader className="shrink-0 border-b border-border/70 px-6 py-5 text-left">
-                                    <DialogTitle className="text-xl tracking-tight">{clip.title}</DialogTitle>
-                                    <DialogDescription>
-                                      {videoMeta?.title ?? "YouTube clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
-                                    </DialogDescription>
-                                  </DialogHeader>
-                                  <div className="grid min-h-0 flex-1 gap-0 lg:grid-cols-[1.2fr_0.8fr]">
-                                    <div className="aspect-video bg-black lg:sticky lg:top-0 lg:min-h-[420px]">
-                                      {currentVideoId ? (
-                                        <iframe
-                                          key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}`}
-                                          src={getClipEmbedUrl(currentVideoId, clip)}
-                                          title={clip.title}
-                                          className="h-full w-full"
-                                          loading="lazy"
-                                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                                          referrerPolicy="strict-origin-when-cross-origin"
-                                          allowFullScreen
-                                        />
-                                      ) : (
-                                        <div className="flex h-full items-center justify-center text-white/70">Preview unavailable</div>
-                                      )}
+                              <DialogContent className="grid max-h-[90vh] w-full max-w-4xl grid-rows-[auto_1fr] gap-0 overflow-hidden rounded-[28px] border-border/70 p-0">
+                                <DialogHeader className="shrink-0 border-b border-border/70 px-6 py-5 text-left">
+                                  <DialogTitle className="text-xl tracking-tight">{clip.title}</DialogTitle>
+                                  <DialogDescription>
+                                    {videoMeta?.title ?? "YouTube clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
+                                  </DialogDescription>
+                                </DialogHeader>
+                                <div className="grid min-h-0 grid-rows-[auto_1fr] overflow-y-auto lg:grid-cols-[1.2fr_0.8fr] lg:grid-rows-1 lg:overflow-hidden">
+                                    <div className="flex items-center justify-center bg-black p-4 lg:h-full lg:min-h-0 lg:p-6">
+                                      <div className="aspect-video w-full max-h-full overflow-hidden rounded-xl">
+                                        {currentVideoId ? (
+                                          <iframe
+                                            key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}`}
+                                            src={getClipEmbedUrl(currentVideoId, clip)}
+                                            title={clip.title}
+                                            className="h-full w-full"
+                                            loading="lazy"
+                                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                                            referrerPolicy="strict-origin-when-cross-origin"
+                                            allowFullScreen
+                                          />
+                                        ) : (
+                                          <div className="flex h-full w-full items-center justify-center text-white/70">Preview unavailable</div>
+                                        )}
+                                      </div>
                                     </div>
-                                    <div className="min-h-0 overflow-y-auto bg-background">
+                                    <div className="flex min-h-0 flex-col overflow-y-auto bg-background lg:h-full">
                                       <div className="space-y-4 px-6 py-5">
                                         <div>
                                           <p className="text-sm font-medium text-muted-foreground">Why AI picked this</p>
@@ -972,7 +973,6 @@ export default function App() {
                                       </div>
                                     </div>
                                   </div>
-                                </div>
                               </DialogContent>
                             </Dialog>
                           </div>
