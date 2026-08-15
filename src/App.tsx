@@ -861,33 +861,33 @@ export default function App() {
                                   <ArrowRight className="size-4" />
                                 </Button>
                               </DialogTrigger>
-                              <DialogContent className="grid max-h-[90vh] w-full max-w-4xl grid-rows-[auto_1fr] gap-0 overflow-hidden rounded-[28px] border-border/70 p-0">
+                              <DialogContent className="flex max-h-[85vh] w-full max-w-4xl flex-col gap-0 overflow-hidden rounded-[28px] border-border/70 p-0">
                                 <DialogHeader className="shrink-0 border-b border-border/70 px-6 py-5 text-left">
                                   <DialogTitle className="text-xl tracking-tight">{clip.title}</DialogTitle>
                                   <DialogDescription>
                                     {videoMeta?.title ?? "YouTube clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
                                   </DialogDescription>
                                 </DialogHeader>
-                                <div className="grid min-h-0 grid-rows-[auto_1fr] overflow-y-auto lg:grid-cols-[1.2fr_0.8fr] lg:grid-rows-1 lg:overflow-hidden">
-                                    <div className="flex items-center justify-center bg-black p-4 lg:h-full lg:min-h-0 lg:p-6">
-                                      <div className="aspect-video w-full max-h-full overflow-hidden rounded-xl">
+                                <div className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
+                                    <div className="w-full shrink-0 bg-black lg:flex lg:h-full lg:w-[60%] lg:items-center lg:justify-center lg:p-6">
+                                      <div className="relative w-full overflow-hidden lg:aspect-video lg:h-auto lg:max-h-full lg:rounded-xl" style={{ aspectRatio: "16 / 9" }}>
                                         {currentVideoId ? (
                                           <iframe
                                             key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}`}
                                             src={getClipEmbedUrl(currentVideoId, clip)}
                                             title={clip.title}
-                                            className="h-full w-full"
+                                            className="absolute inset-0 h-full w-full"
                                             loading="lazy"
                                             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                                             referrerPolicy="strict-origin-when-cross-origin"
                                             allowFullScreen
                                           />
                                         ) : (
-                                          <div className="flex h-full w-full items-center justify-center text-white/70">Preview unavailable</div>
+                                          <div className="absolute inset-0 flex items-center justify-center text-white/70">Preview unavailable</div>
                                         )}
                                       </div>
                                     </div>
-                                    <div className="flex min-h-0 flex-col overflow-y-auto bg-background lg:h-full">
+                                    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-background lg:h-full lg:w-[40%]">
                                       <div className="space-y-4 px-6 py-5">
                                         <div>
                                           <p className="text-sm font-medium text-muted-foreground">Why AI picked this</p>
