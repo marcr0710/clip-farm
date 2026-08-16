@@ -52,26 +52,55 @@ async function getFFmpeg(onProgress?: (ratio: number) => void): Promise<FFmpeg> 
 
 export type ShortsAspect = "9:16" | "1:1" | "16:9";
 
+/** Normalized focus point inside the source frame. 0.5/0.5 = center. */
+export type CropFocus = {
+  /** 0 = left edge, 1 = right edge */
+  focusX?: number;
+  /** 0 = top edge, 1 = bottom edge */
+  focusY?: number;
+};
+
 export type ClientTrimOptions = {
   file: File;
   startSeconds: number;
   endSeconds: number;
   /** Output framing. Defaults to YouTube Shorts 9:16. */
   aspect?: ShortsAspect;
+  /** Where the crop window should stay locked. Defaults to center. */
+  focusX?: number;
+  focusY?: number;
   onStatus?: (message: string) => void;
   onProgress?: (ratio: number) => void;
 };
 
-/** Center-crop + scale filter for Shorts / Reels / square / landscape. */
-export function aspectFilter(aspect: ShortsAspect = "9:16"): string {
+function clamp01(value: number, fallback = 0.5): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(1, Math.max(0, value));
+}
+
+/**
+ * Scale-to-cover + crop filter for Shorts / Reels / square / landscape.
+ * `focusX` / `focusY` (0–1) shift the crop window toward the speaker
+ * instead of always taking the geometric center.
+ */
+export function aspectFilter(
+  aspect: ShortsAspect = "9:16",
+  focus: CropFocus = {},
+): string {
+  const fx = clamp01(focus.focusX ?? 0.5);
+  const fy = clamp01(focus.focusY ?? 0.5);
+  // Keep expression compact for ffmpeg.wasm arg parsing.
+  const x = `(iw-ow)*${fx.toFixed(4)}`;
+  const y = `(ih-oh)*${fy.toFixed(4)}`;
+
   if (aspect === "1:1") {
-    return "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,setsar=1";
+    return `scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080:${x}:${y},setsar=1`;
   }
   if (aspect === "16:9") {
-    return "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1";
+    return `scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080:${x}:${y},setsar=1`;
   }
   // YouTube Shorts / Reels default
-  return "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1";
+  return `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:${x}:${y},setsar=1`;
 }
 
 /**
@@ -84,13 +113,15 @@ export async function trimVideoInBrowser({
   startSeconds,
   endSeconds,
   aspect = "9:16",
+  focusX = 0.5,
+  focusY = 0.5,
   onStatus,
   onProgress,
 }: ClientTrimOptions): Promise<Blob> {
   const start = Math.max(0, Number(startSeconds) || 0);
   const requestedEnd = Math.max(start + 0.25, Number(endSeconds) || start + 1);
   const duration = Math.min(requestedEnd - start, MAX_CLIP_SECONDS);
-  const vf = aspectFilter(aspect);
+  const vf = aspectFilter(aspect, { focusX, focusY });
 
   onStatus?.("Loading the local video engine (first run downloads ~25 MB)…");
   const ffmpeg = await getFFmpeg(onProgress);

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  Crosshair,
   LoaderCircle,
   RotateCcw,
+  ScanFace,
   Scissors,
   Upload,
 } from "lucide-react";
@@ -20,6 +22,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { detectSpeakerFocus, focusToObjectPosition } from "@/lib/face-focus";
 import { cn } from "@/lib/utils";
 
 export type PreviewClip = {
@@ -32,6 +35,10 @@ export type PreviewClip = {
   durationSeconds: number;
   originalStartSeconds: number;
   originalEndSeconds: number;
+  /** 0 = left, 1 = right. Where the vertical crop window is locked. */
+  focusX: number;
+  /** 0 = top, 1 = bottom. Where the horizontal crop window is locked. */
+  focusY: number;
   score: number;
   format: string;
   captionStyle: string;
@@ -43,6 +50,7 @@ type ClipPreviewDialogProps = {
   videoTitle?: string;
   currentVideoId: string;
   uploadedPreviewUrl: string;
+  thumbnailUrl?: string;
   hasUploadedFile: boolean;
   hasYouTubeLink: boolean;
   getClipEmbedUrl: (videoId: string, clip: Pick<PreviewClip, "startSeconds" | "endSeconds">) => string;
@@ -52,6 +60,8 @@ type ClipPreviewDialogProps = {
   mediaDurationSeconds?: number;
   onUpdateTiming: (clipId: number, startSeconds: number, endSeconds: number) => void;
   onResetTiming: (clipId: number) => void;
+  onUpdateFocus: (clipId: number, focusX: number, focusY: number) => void;
+  onResetFocus: (clipId: number) => void;
   onRender: (clip: PreviewClip) => void;
   onDownloadBrief: (clip: PreviewClip) => void;
   onUploadClick: () => void;
@@ -61,6 +71,7 @@ type ClipPreviewDialogProps = {
 };
 
 const MIN_GAP = 1;
+const FOCUS_EPS = 0.02;
 
 function previewFrameClass(format: string) {
   if (format === "16:9") return "aspect-video w-full max-w-3xl";
@@ -68,20 +79,30 @@ function previewFrameClass(format: string) {
   return "aspect-[9/16] w-full max-w-[320px]";
 }
 
+function clamp01(value: number) {
+  if (!Number.isFinite(value)) return 0.5;
+  return Math.min(1, Math.max(0, value));
+}
+
 function LocalClipPlayer({
   src,
   startSeconds,
   endSeconds,
+  focusX,
+  focusY,
   className,
 }: {
   src: string;
   startSeconds: number;
   endSeconds: number;
+  focusX: number;
+  focusY: number;
   className?: string;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const start = Math.max(0, startSeconds);
   const end = Math.max(start + 0.25, endSeconds);
+  const objectPosition = focusToObjectPosition(focusX, focusY);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -122,10 +143,118 @@ function LocalClipPlayer({
       key={`${src}-${start.toFixed(2)}-${end.toFixed(2)}`}
       src={src}
       className={cn("h-full w-full object-cover", className)}
+      style={{ objectPosition }}
       controls
       playsInline
       preload="metadata"
     />
+  );
+}
+
+function FocusPreview({
+  src,
+  poster,
+  startSeconds,
+  endSeconds,
+  focusX,
+  focusY,
+  format,
+  isYouTubeEmbed,
+  embedUrl,
+  title,
+}: {
+  src?: string;
+  poster?: string;
+  startSeconds: number;
+  endSeconds: number;
+  focusX: number;
+  focusY: number;
+  format: string;
+  isYouTubeEmbed: boolean;
+  embedUrl?: string;
+  title: string;
+}) {
+  const frameClass = previewFrameClass(format);
+  const objectPosition = focusToObjectPosition(focusX, focusY);
+
+  // YouTube embeds can't be object-positioned. Show a framed still/thumbnail
+  // with the live focus overlay, plus a small note that export uses the pan.
+  if (isYouTubeEmbed && embedUrl) {
+    return (
+      <div
+        className={cn(
+          "relative overflow-hidden rounded-[28px] border border-white/10 bg-black shadow-2xl shadow-black/40",
+          frameClass,
+        )}
+      >
+        {poster ? (
+          <img
+            src={poster}
+            alt=""
+            className="absolute inset-0 h-full w-full object-cover"
+            style={{ objectPosition }}
+            draggable={false}
+          />
+        ) : (
+          <iframe
+            key={`${title}-${startSeconds.toFixed(2)}-${endSeconds.toFixed(2)}`}
+            src={embedUrl}
+            title={title}
+            className="absolute inset-0 h-full w-full opacity-80"
+            loading="lazy"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            referrerPolicy="strict-origin-when-cross-origin"
+            allowFullScreen
+          />
+        )}
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-black/20" />
+        <div
+          className="pointer-events-none absolute size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.4)]"
+          style={{ left: `${focusX * 100}%`, top: `${focusY * 100}%` }}
+        >
+          <div className="absolute inset-1 rounded-full bg-white/30" />
+        </div>
+      </div>
+    );
+  }
+
+  if (src) {
+    return (
+      <div
+        className={cn(
+          "relative overflow-hidden rounded-[28px] border border-white/10 bg-black shadow-2xl shadow-black/40",
+          frameClass,
+        )}
+      >
+        <LocalClipPlayer
+          src={src}
+          startSeconds={startSeconds}
+          endSeconds={endSeconds}
+          focusX={focusX}
+          focusY={focusY}
+          className="absolute inset-0"
+        />
+        <div
+          className="pointer-events-none absolute size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.4)]"
+          style={{ left: `${focusX * 100}%`, top: `${focusY * 100}%` }}
+        >
+          <div className="absolute inset-1 rounded-full bg-white/25" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "relative overflow-hidden rounded-[28px] border border-white/10 bg-black shadow-2xl shadow-black/40",
+        frameClass,
+      )}
+    >
+      <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-white/70">
+        Upload a video or add a YouTube link to preview this clip.
+      </div>
+    </div>
   );
 }
 
@@ -134,6 +263,7 @@ export function ClipPreviewDialog({
   videoTitle,
   currentVideoId,
   uploadedPreviewUrl,
+  thumbnailUrl,
   hasUploadedFile,
   hasYouTubeLink,
   getClipEmbedUrl,
@@ -143,6 +273,8 @@ export function ClipPreviewDialog({
   mediaDurationSeconds,
   onUpdateTiming,
   onResetTiming,
+  onUpdateFocus,
+  onResetFocus,
   onRender,
   onDownloadBrief,
   onUploadClick,
@@ -153,12 +285,71 @@ export function ClipPreviewDialog({
   const [startDraft, setStartDraft] = useState(formatTimePrecise(clip.startSeconds));
   const [endDraft, setEndDraft] = useState(formatTimePrecise(clip.endSeconds));
   const [open, setOpen] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+  const [detectNote, setDetectNote] = useState<string | null>(null);
+  const detectAbortRef = useRef<AbortController | null>(null);
 
   // Keep draft inputs in sync when the parent clip range changes (slider / reset).
   useEffect(() => {
     setStartDraft(formatTimePrecise(clip.startSeconds));
     setEndDraft(formatTimePrecise(clip.endSeconds));
   }, [clip.startSeconds, clip.endSeconds, formatTimePrecise]);
+
+  // Auto-detect speaker focus once when the dialog opens with a local file
+  // and the user hasn't already panned away from center.
+  useEffect(() => {
+    if (!open || !uploadedPreviewUrl) return;
+    const isDefaultFocus =
+      Math.abs(clip.focusX - 0.5) < FOCUS_EPS && Math.abs(clip.focusY - 0.5) < FOCUS_EPS;
+    if (!isDefaultFocus) return;
+
+    const controller = new AbortController();
+    detectAbortRef.current = controller;
+    setDetecting(true);
+    setDetectNote("Finding the speaker…");
+
+    detectSpeakerFocus({
+      src: uploadedPreviewUrl,
+      startSeconds: clip.startSeconds,
+      endSeconds: clip.endSeconds,
+      signal: controller.signal,
+    })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        if (result.source === "center" || result.samples === 0) {
+          setDetectNote("Couldn't lock a face — drag the focus or use the sliders.");
+          return;
+        }
+        onUpdateFocus(clip.id, result.focusX, result.focusY);
+        setDetectNote(
+          result.source === "face-detector"
+            ? "Speaker locked from face detection."
+            : "Speaker locked from visual analysis.",
+        );
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setDetectNote("Face detect unavailable — pan manually.");
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetecting(false);
+      });
+
+    return () => {
+      controller.abort();
+      detectAbortRef.current = null;
+    };
+    // Only re-run when the dialog opens or the source clip identity changes —
+    // not on every focus tweak the user makes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, uploadedPreviewUrl, clip.id, clip.startSeconds, clip.endSeconds]);
+
+  useEffect(() => {
+    return () => {
+      detectAbortRef.current?.abort();
+    };
+  }, []);
 
   const maxBound = useMemo(() => {
     if (mediaDurationSeconds && mediaDurationSeconds > 0) return mediaDurationSeconds;
@@ -169,6 +360,9 @@ export function ClipPreviewDialog({
   const isEdited =
     Math.abs(clip.startSeconds - clip.originalStartSeconds) > 0.05 ||
     Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05;
+
+  const isFocusEdited =
+    Math.abs(clip.focusX - 0.5) > FOCUS_EPS || Math.abs(clip.focusY - 0.5) > FOCUS_EPS;
 
   const startPct = Math.min(100, Math.max(0, (clip.startSeconds / maxBound) * 100));
   const endPct = Math.min(100, Math.max(0, (clip.endSeconds / maxBound) * 100));
@@ -199,7 +393,43 @@ export function ClipPreviewDialog({
     }
   };
 
-  const frameClass = previewFrameClass(clip.format);
+  const runDetect = async () => {
+    if (!uploadedPreviewUrl) {
+      setDetectNote("Upload a video file to auto-detect the speaker.");
+      return;
+    }
+    detectAbortRef.current?.abort();
+    const controller = new AbortController();
+    detectAbortRef.current = controller;
+    setDetecting(true);
+    setDetectNote("Scanning frames for a face…");
+    try {
+      const result = await detectSpeakerFocus({
+        src: uploadedPreviewUrl,
+        startSeconds: clip.startSeconds,
+        endSeconds: clip.endSeconds,
+        sampleCount: 6,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      if (result.source === "center" || result.samples === 0) {
+        setDetectNote("No clear face found — pan the focus manually.");
+        return;
+      }
+      onUpdateFocus(clip.id, result.focusX, result.focusY);
+      setDetectNote(
+        result.source === "face-detector"
+          ? "Speaker locked from face detection."
+          : "Speaker locked from visual analysis.",
+      );
+    } catch {
+      if (!controller.signal.aborted) setDetectNote("Detection failed — pan manually.");
+    } finally {
+      if (!controller.signal.aborted) setDetecting(false);
+    }
+  };
+
+  const embedUrl = currentVideoId ? getClipEmbedUrl(currentVideoId, clip) : undefined;
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -222,7 +452,7 @@ export function ClipPreviewDialog({
                 {formatTime(clip.durationSeconds)} · {clip.format} Shorts frame
               </DialogDescription>
             </div>
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
               <Badge variant="secondary" className="rounded-full px-3 py-1">
                 Score {clip.score}
               </Badge>
@@ -232,6 +462,11 @@ export function ClipPreviewDialog({
               {isEdited ? (
                 <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
                   Manually trimmed
+                </Badge>
+              ) : null}
+              {isFocusEdited ? (
+                <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
+                  Reframed
                 </Badge>
               ) : null}
             </div>
@@ -248,38 +483,20 @@ export function ClipPreviewDialog({
                   ? "Square · 1:1"
                   : "Landscape · 16:9"}
             </p>
-            <div
-              className={cn(
-                "relative overflow-hidden rounded-[28px] border border-white/10 bg-black shadow-2xl shadow-black/40",
-                frameClass,
-              )}
-            >
-              {currentVideoId ? (
-                <iframe
-                  key={`${clip.id}-${clip.startSeconds.toFixed(2)}-${clip.endSeconds.toFixed(2)}`}
-                  src={getClipEmbedUrl(currentVideoId, clip)}
-                  title={clip.title}
-                  className="absolute inset-0 h-full w-full"
-                  loading="lazy"
-                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                  referrerPolicy="strict-origin-when-cross-origin"
-                  allowFullScreen
-                />
-              ) : uploadedPreviewUrl ? (
-                <LocalClipPlayer
-                  src={uploadedPreviewUrl}
-                  startSeconds={clip.startSeconds}
-                  endSeconds={clip.endSeconds}
-                  className="absolute inset-0"
-                />
-              ) : (
-                <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-sm text-white/70">
-                  Upload a video or add a YouTube link to preview this clip.
-                </div>
-              )}
-            </div>
+            <FocusPreview
+              src={uploadedPreviewUrl || undefined}
+              poster={thumbnailUrl}
+              startSeconds={clip.startSeconds}
+              endSeconds={clip.endSeconds}
+              focusX={clip.focusX}
+              focusY={clip.focusY}
+              format={clip.format}
+              isYouTubeEmbed={Boolean(currentVideoId) && !uploadedPreviewUrl}
+              embedUrl={embedUrl}
+              title={clip.title}
+            />
             <p className="max-w-[280px] text-center text-xs leading-5 text-white/45">
-              Preview is framed to the export aspect. Downloaded MP4s are center-cropped and scaled to match.
+              Preview follows your speaker focus. Downloaded MP4s crop to the same point — not just the middle of the frame.
             </p>
           </div>
 
@@ -445,6 +662,123 @@ export function ClipPreviewDialog({
                 </p>
               </div>
 
+              {/* Speaker focus / reframing */}
+              <div className="rounded-2xl border border-border/70 bg-card p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="inline-flex items-center gap-1.5 text-sm font-semibold tracking-tight">
+                      <Crosshair className="size-3.5 text-primary" />
+                      Speaker focus
+                    </p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      Shift the {clip.format} crop onto the person talking instead of dead-center.
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 gap-1.5 rounded-xl text-xs"
+                      disabled={detecting || !uploadedPreviewUrl}
+                      onClick={() => void runDetect()}
+                    >
+                      {detecting ? (
+                        <LoaderCircle className="size-3.5 animate-spin" />
+                      ) : (
+                        <ScanFace className="size-3.5" />
+                      )}
+                      {detecting ? "Detecting…" : "Auto-detect"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 gap-1.5 rounded-xl text-xs"
+                      disabled={!isFocusEdited}
+                      onClick={() => {
+                        onResetFocus(clip.id);
+                        setDetectNote(null);
+                      }}
+                    >
+                      <RotateCcw className="size-3.5" />
+                      Center
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <Label htmlFor={`focus-x-${clip.id}`} className="text-xs font-medium">
+                        Horizontal
+                      </Label>
+                      <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+                        {clip.focusX < 0.4 ? "Left" : clip.focusX > 0.6 ? "Right" : "Center"} ·{" "}
+                        {(clip.focusX * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <input
+                      id={`focus-x-${clip.id}`}
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={clip.focusX}
+                      aria-label="Horizontal focus"
+                      className="h-2 w-full cursor-ew-resize appearance-none rounded-full bg-muted accent-primary"
+                      onChange={(event) =>
+                        onUpdateFocus(clip.id, clamp01(Number(event.target.value)), clip.focusY)
+                      }
+                    />
+                    <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
+                      <span>Left</span>
+                      <span>Right</span>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <Label htmlFor={`focus-y-${clip.id}`} className="text-xs font-medium">
+                        Vertical
+                      </Label>
+                      <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+                        {clip.focusY < 0.4 ? "Up" : clip.focusY > 0.6 ? "Down" : "Middle"} ·{" "}
+                        {(clip.focusY * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <input
+                      id={`focus-y-${clip.id}`}
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={clip.focusY}
+                      aria-label="Vertical focus"
+                      className="h-2 w-full cursor-ns-resize appearance-none rounded-full bg-muted accent-primary"
+                      onChange={(event) =>
+                        onUpdateFocus(clip.id, clip.focusX, clamp01(Number(event.target.value)))
+                      }
+                    />
+                    <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
+                      <span>Up</span>
+                      <span>Down</span>
+                    </div>
+                  </div>
+                </div>
+
+                {detectNote ? (
+                  <p className="mt-3 text-[11px] leading-4 text-muted-foreground">{detectNote}</p>
+                ) : !uploadedPreviewUrl ? (
+                  <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+                    Upload a local video for auto face-lock. YouTube-only previews still honor the manual pan on export.
+                  </p>
+                ) : (
+                  <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+                    Auto-detect samples frames in this trim range and locks onto the largest face.
+                  </p>
+                )}
+              </div>
+
               <div>
                 <p className="text-sm font-medium text-muted-foreground">Why AI picked this</p>
                 <p className="mt-2 text-sm leading-6">{clip.reason}</p>
@@ -529,8 +863,8 @@ export function ClipPreviewDialog({
               ) : (
                 <p className="mt-2 text-xs text-muted-foreground">
                   {hasUploadedFile
-                    ? `Exports a ${clip.format} MP4 from your local file using the trimmed start/end above.`
-                    : `Downloads a real cut re-encoded to ${clip.format} with your trimmed start and end.`}
+                    ? `Exports a ${clip.format} MP4 from your local file using the trimmed range and speaker focus above.`
+                    : `Downloads a real cut re-encoded to ${clip.format} with your trim and speaker focus.`}
                 </p>
               )}
 
@@ -539,7 +873,7 @@ export function ClipPreviewDialog({
                   <Separator className="my-4" />
                   <div className="flex items-center justify-between gap-3 rounded-2xl border border-dashed border-border/70 bg-background/60 p-3">
                     <p className="text-xs leading-5 text-muted-foreground">
-                      If YouTube blocks the download above, upload your own copy to trim it reliably.
+                      Upload your own copy to auto-detect faces and trim more reliably if YouTube blocks the download.
                     </p>
                     <Button
                       type="button"

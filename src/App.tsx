@@ -61,6 +61,10 @@ interface Clip {
   originalStartSeconds: number;
   /** AI-proposed end, kept so the user can reset a manual trim. */
   originalEndSeconds: number;
+  /** 0 = left, 1 = right. Crop window lock for speaker-aware framing. */
+  focusX: number;
+  /** 0 = top, 1 = bottom. Crop window lock for speaker-aware framing. */
+  focusY: number;
   score: number;
   format: string;
   captionStyle: string;
@@ -774,7 +778,9 @@ Hard rules for every clip:
 - If a strong idea needs 40s to finish cleanly, use 40s. If it lands in 24s, stop there.
 - Use ONLY timestamps that appear in the timeline windows below (or clearly inside those ranges). Do not invent times far outside the provided windows.
 - Prefer moments spread across the full timeline, not clustered in the first two minutes.
-- Rank by viral potential (hook strength, surprise, emotion, concrete lesson, disagreement, replay value). Highest score first.
+- Prefer speaker-forward moments that will reframe cleanly as vertical Shorts: one clear talker, direct address, reaction, or A-roll face time. Deprioritize wide multi-person panels, dense slide decks, and B-roll-only stretches unless the line is exceptional.
+- In reason, briefly note why the moment works on camera for a vertical crop (e.g. single speaker, strong delivery, visual punch).
+- Rank by viral potential (hook strength, surprise, emotion, concrete lesson, disagreement, replay value, and how well it will look as a 9:16 talking-head short). Highest score first.
 - title: short editorial label for the moment.
 - hook: the exact opening line or promise the viewer hears first.
 - reason: one sentence on why this cut works as a standalone short.
@@ -1130,6 +1136,9 @@ export default function App() {
         durationSeconds: timing.durationSeconds,
         originalStartSeconds: timing.startSeconds,
         originalEndSeconds: timing.endSeconds,
+        // Center until the user pans or auto face-detect locks a speaker.
+        focusX: 0.5,
+        focusY: 0.5,
         score: Math.max(1, Math.min(99, Math.round(Number(candidate.score) || 80))),
         format: getFormatForPlatform(platform),
         captionStyle: getCaptionLabel(captionPreset),
@@ -1191,6 +1200,27 @@ export default function App() {
     );
   };
 
+  const clampFocus = (value: number) => {
+    if (!Number.isFinite(value)) return 0.5;
+    return Math.min(1, Math.max(0, value));
+  };
+
+  const updateClipFocus = (clipId: number, focusX: number, focusY: number) => {
+    setClips((previous) =>
+      previous.map((clip) =>
+        clip.id === clipId
+          ? { ...clip, focusX: clampFocus(focusX), focusY: clampFocus(focusY) }
+          : clip,
+      ),
+    );
+  };
+
+  const resetClipFocus = (clipId: number) => {
+    setClips((previous) =>
+      previous.map((clip) => (clip.id === clipId ? { ...clip, focusX: 0.5, focusY: 0.5 } : clip)),
+    );
+  };
+
   const handleDownloadClipBrief = (clip: Clip) => {
     const payload = {
       exportedAt: new Date().toISOString(),
@@ -1217,11 +1247,15 @@ export default function App() {
         score: clip.score,
         format: clip.format,
         aspect: aspectFromFormat(clip.format),
+        focusX: clip.focusX,
+        focusY: clip.focusY,
         captionStyle: clip.captionStyle,
         transcriptExcerpt: clip.transcriptExcerpt,
         manuallyTrimmed:
           Math.abs(clip.startSeconds - clip.originalStartSeconds) > 0.05 ||
           Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05,
+        reframed:
+          Math.abs(clip.focusX - 0.5) > 0.02 || Math.abs(clip.focusY - 0.5) > 0.02,
         previewUrl: currentVideoId ? getClipEmbedUrl(currentVideoId, clip) : null,
         youtubeUrl: currentVideoId
           ? `https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`
@@ -1261,6 +1295,8 @@ export default function App() {
         startSeconds: clip.startSeconds,
         endSeconds: clip.endSeconds,
         aspect: aspectFromFormat(clip.format),
+        focusX: clip.focusX,
+        focusY: clip.focusY,
         onStatus: (message) => {
           setUploadRenderStatus((prev) => ({ ...prev, [clip.id]: message }));
         },
@@ -1321,6 +1357,8 @@ export default function App() {
           startSeconds: clip.startSeconds,
           endSeconds: clip.endSeconds,
           aspect: aspectFromFormat(clip.format),
+        focusX: clip.focusX,
+        focusY: clip.focusY,
         }),
       });
 
@@ -1856,9 +1894,25 @@ export default function App() {
                         <MagicCard key={clip.id} className="rounded-[24px] border border-border/70 bg-background/80 p-4 shadow-sm">
                           <div className="relative overflow-hidden rounded-[20px] border border-primary/15 bg-[linear-gradient(180deg,rgba(66,112,240,0.18),rgba(66,112,240,0.04))]">
                             {videoMeta?.thumbnailUrl ? (
-                              <img src={videoMeta.thumbnailUrl} alt={videoMeta.title} className="aspect-[9/16] w-full object-cover opacity-70" />
+                              <img
+                                src={videoMeta.thumbnailUrl}
+                                alt={videoMeta.title}
+                                className="aspect-[9/16] w-full object-cover opacity-70"
+                                style={{
+                                  objectPosition: `${(clip.focusX * 100).toFixed(1)}% ${(clip.focusY * 100).toFixed(1)}%`,
+                                }}
+                              />
                             ) : uploadedPreviewUrl ? (
-                              <video src={uploadedPreviewUrl} className="aspect-[9/16] w-full object-cover opacity-70" muted playsInline preload="metadata" />
+                              <video
+                                src={uploadedPreviewUrl}
+                                className="aspect-[9/16] w-full object-cover opacity-70"
+                                style={{
+                                  objectPosition: `${(clip.focusX * 100).toFixed(1)}% ${(clip.focusY * 100).toFixed(1)}%`,
+                                }}
+                                muted
+                                playsInline
+                                preload="metadata"
+                              />
                             ) : (
                               <div className="aspect-[9/16] bg-muted/70" />
                             )}
@@ -1883,6 +1937,9 @@ export default function App() {
                                     Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05) && (
                                     <span className="ml-1.5 text-primary">· edited</span>
                                   )}
+                                  {(Math.abs(clip.focusX - 0.5) > 0.02 || Math.abs(clip.focusY - 0.5) > 0.02) && (
+                                    <span className="ml-1.5 text-primary">· reframed</span>
+                                  )}
                                 </p>
                               </div>
                               <PlayCircle className="mt-1 size-5 text-primary" />
@@ -1897,6 +1954,7 @@ export default function App() {
                               videoTitle={videoMeta?.title ?? uploadedFile?.name}
                               currentVideoId={currentVideoId}
                               uploadedPreviewUrl={uploadedPreviewUrl}
+                              thumbnailUrl={videoMeta?.thumbnailUrl}
                               hasUploadedFile={Boolean(uploadedFile)}
                               hasYouTubeLink={hasYouTubeLink}
                               getClipEmbedUrl={getClipEmbedUrl}
@@ -1906,6 +1964,8 @@ export default function App() {
                               mediaDurationSeconds={mediaDurationSeconds}
                               onUpdateTiming={updateClipTiming}
                               onResetTiming={resetClipTiming}
+                              onUpdateFocus={updateClipFocus}
+                              onResetFocus={resetClipFocus}
                               onRender={handleRenderClip}
                               onDownloadBrief={handleDownloadClipBrief}
                               onUploadClick={() => uploadInputRef.current?.click()}

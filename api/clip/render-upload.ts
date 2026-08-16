@@ -63,7 +63,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const workDir = await mkdtemp(path.join(tmpdir(), "clipcraft-upload-"));
 
   try {
-    const { fileBase64, mimeType, startSeconds, endSeconds, title, aspect } = req.body ?? {};
+    const { fileBase64, mimeType, startSeconds, endSeconds, title, aspect, focusX, focusY } =
+      req.body ?? {};
 
     if (typeof fileBase64 !== "string" || !fileBase64.trim()) {
       return res.status(400).json({ error: "No video file data was received." });
@@ -76,7 +77,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     const duration = Math.min(requestedEnd - start, MAX_CLIP_SECONDS);
     const resolvedAspect = resolveAspect(aspect);
-    const vf = aspectVideoFilter(resolvedAspect);
+    const fx = Number(focusX);
+    const fy = Number(focusY);
+    const vf = aspectVideoFilter(resolvedAspect, {
+      focusX: Number.isFinite(fx) ? Math.min(1, Math.max(0, fx)) : 0.5,
+      focusY: Number.isFinite(fy) ? Math.min(1, Math.max(0, fy)) : 0.5,
+    });
 
     let sourceBuffer: Buffer;
     try {

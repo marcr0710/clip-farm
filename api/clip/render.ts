@@ -21,7 +21,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { url, startSeconds, endSeconds, aspect } = req.body ?? {};
+    const { url, startSeconds, endSeconds, aspect, focusX, focusY } = req.body ?? {};
 
     if (typeof url !== "string" || !url.trim()) {
       return res.status(400).json({ error: "A YouTube url is required." });
@@ -33,11 +33,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "Valid startSeconds and endSeconds are required." });
     }
 
+    const fx = Number(focusX);
+    const fy = Number(focusY);
+
     const { buffer, filename } = await renderClip({
       url,
       startSeconds: start,
       endSeconds: end,
       aspect: resolveAspect(aspect),
+      focusX: Number.isFinite(fx) ? Math.min(1, Math.max(0, fx)) : 0.5,
+      focusY: Number.isFinite(fy) ? Math.min(1, Math.max(0, fy)) : 0.5,
     });
 
     res.writeHead(200, {

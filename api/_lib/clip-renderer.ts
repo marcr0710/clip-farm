@@ -17,12 +17,22 @@ const MAX_CLIP_SECONDS = 120;
 
 export type RenderAspect = "9:16" | "1:1" | "16:9";
 
+export interface CropFocus {
+  /** 0 = left edge, 1 = right edge. Defaults to 0.5 (center). */
+  focusX?: number;
+  /** 0 = top edge, 1 = bottom edge. Defaults to 0.5 (center). */
+  focusY?: number;
+}
+
 export interface RenderClipParams {
   url: string;
   startSeconds: number;
   endSeconds: number;
   /** Output framing. Defaults to YouTube Shorts 9:16. */
   aspect?: RenderAspect;
+  /** Where the crop window should stay locked. Defaults to center. */
+  focusX?: number;
+  focusY?: number;
 }
 
 export interface RenderClipResult {
@@ -30,15 +40,32 @@ export interface RenderClipResult {
   filename: string;
 }
 
-/** Center-crop + scale filter for Shorts / Reels / square / landscape. */
-export function aspectVideoFilter(aspect: RenderAspect = "9:16"): string {
+function clamp01(value: number, fallback = 0.5): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(1, Math.max(0, value));
+}
+
+/**
+ * Scale-to-cover + crop filter for Shorts / Reels / square / landscape.
+ * `focusX` / `focusY` (0–1) shift the crop window toward the speaker
+ * instead of always taking the geometric center.
+ */
+export function aspectVideoFilter(
+  aspect: RenderAspect = "9:16",
+  focus: CropFocus = {},
+): string {
+  const fx = clamp01(focus.focusX ?? 0.5);
+  const fy = clamp01(focus.focusY ?? 0.5);
+  const x = `(iw-ow)*${fx.toFixed(4)}`;
+  const y = `(ih-oh)*${fy.toFixed(4)}`;
+
   if (aspect === "1:1") {
-    return "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,setsar=1";
+    return `scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080:${x}:${y},setsar=1`;
   }
   if (aspect === "16:9") {
-    return "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1";
+    return `scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080:${x}:${y},setsar=1`;
   }
-  return "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1";
+  return `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:${x}:${y},setsar=1`;
 }
 
 function getVideoId(url: string): string | null {
@@ -84,6 +111,8 @@ export async function renderClip({
   startSeconds,
   endSeconds,
   aspect = "9:16",
+  focusX = 0.5,
+  focusY = 0.5,
 }: RenderClipParams): Promise<RenderClipResult> {
   const videoId = getVideoId(url);
   if (!videoId) {
@@ -96,7 +125,7 @@ export async function renderClip({
   const start = Math.max(0, Number(startSeconds) || 0);
   const requestedEnd = Math.max(start + 0.25, Number(endSeconds) || start + 1);
   const duration = Math.min(requestedEnd - start, MAX_CLIP_SECONDS);
-  const vf = aspectVideoFilter(aspect);
+  const vf = aspectVideoFilter(aspect, { focusX, focusY });
 
   const BOT_CHECK_MESSAGE =
     "YouTube is blocking video downloads from this server (it shows YouTube's own \"Sign in to confirm you're not a bot\" check). This is a network-level block YouTube applies to datacenter/cloud IP ranges — it isn't something this app's code can fix. Use the clip brief export instead, or try again later.";
