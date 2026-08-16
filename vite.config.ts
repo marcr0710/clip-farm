@@ -2,7 +2,7 @@ import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
-import { renderClip } from "./api/_lib/clip-renderer";
+import { appbuilderApiDevServer } from "./vite-plugins/appbuilder-api-dev-server";
 
 function aiProxyPlugin(): Plugin {
   let env: Record<string, string> = {};
@@ -82,59 +82,15 @@ function aiProxyPlugin(): Plugin {
   };
 }
 
-function clipRenderPlugin(): Plugin {
-  return {
-    name: "clip-render-proxy",
-    configureServer(server) {
-      server.middlewares.use("/api/clip/render", async (req, res) => {
-        if (req.method === "OPTIONS") {
-          res.writeHead(204, {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Content-Type",
-          });
-          res.end();
-          return;
-        }
-
-        if (req.method !== "POST") {
-          res.writeHead(405, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Method not allowed" }));
-          return;
-        }
-
-        try {
-          const chunks: Buffer[] = [];
-          for await (const chunk of req) chunks.push(Buffer.from(chunk));
-          const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-
-          const start = Number(body.startSeconds);
-          const end = Number(body.endSeconds);
-          if (typeof body.url !== "string" || !body.url.trim() || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "A valid url, startSeconds, and endSeconds are required." }));
-            return;
-          }
-
-          const { buffer, filename } = await renderClip({ url: body.url, startSeconds: start, endSeconds: end });
-
-          res.writeHead(200, {
-            "Content-Type": "video/mp4",
-            "Content-Disposition": `attachment; filename="${filename}"`,
-            "Content-Length": buffer.length,
-          });
-          res.end(buffer);
-        } catch (error) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Clip rendering failed." }));
-        }
-      });
-    },
-  };
-}
-
 export default defineConfig({
   optimizeDeps: { exclude: ["@electric-sql/pglite"] },
-  plugins: [react(), tailwindcss(), aiProxyPlugin(), clipRenderPlugin()],
+  // `aiProxyPlugin` stays because it streams Server-Sent Events directly
+  // (res.write per chunk) — the generic api router below buffers full
+  // responses via ssrLoadModule + res.json()/res.send(), which doesn't fit a
+  // stream. `appbuilderApiDevServer` auto-resolves every other api/*.ts file
+  // (clip/render, clip/render-upload, youtube/transcript, and any future
+  // route) without hand-writing a middleware block per endpoint.
+  plugins: [react(), tailwindcss(), aiProxyPlugin(), appbuilderApiDevServer()],
   resolve: {
     alias: { "@": path.resolve(__dirname, "./src") },
   },
