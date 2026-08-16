@@ -72,6 +72,8 @@ interface VideoMeta {
   author: string;
   thumbnailUrl: string;
   videoId: string;
+  source: "youtube" | "upload";
+  durationSeconds?: number;
 }
 
 interface AICandidate {
@@ -83,10 +85,18 @@ interface AICandidate {
   score: number;
 }
 
-const STAGES = [
+const YOUTUBE_STAGES = [
   "Validating the YouTube link",
   "Loading metadata and embedded preview",
   "Building transcript windows for the full timeline",
+  "AI scoring viral hooks, payoff, surprise, and replay value",
+  "Preparing preview-ready clip ranges and captions",
+];
+
+const UPLOAD_STAGES = [
+  "Reading the uploaded video file",
+  "Loading local video metadata",
+  "Building clip windows from the file timeline",
   "AI scoring viral hooks, payoff, surprise, and replay value",
   "Preparing preview-ready clip ranges and captions",
 ];
@@ -267,13 +277,69 @@ const getCaptionLabel = (captionPreset: string) => {
   return "Bold punch captions";
 };
 
-const buildPrompt = (meta: VideoMeta | null, windows: TranscriptWindow[]) => {
+const buildPrompt = (meta: VideoMeta | null, windows: TranscriptWindow[], sourceLabel = "video transcript") => {
   const transcript = windows
     .map((window, index) => `${index + 1}. ${formatTime(window.startSeconds)}-${formatTime(window.endSeconds)} | ${window.text}`)
     .join("\n");
 
-  return `You are ranking viral short-form clip candidates from a YouTube video transcript.\n\nVideo title: ${meta?.title ?? "Unknown"}\nChannel: ${meta?.author ?? "Unknown"}\n\nRules:\n- Pick the 3 best standalone clips.\n- Determine natural clip lengths from the content itself; do not force a fixed duration.\n- Never cut off setup, payoff, or the final key sentence.\n- Favor strong hooks, tension, surprise, emotional payoff, concrete lessons, disagreement potential, and replay value.\n- Keep clips between 15 and 70 seconds when possible.\n- Return valid JSON only in this exact shape:\n{\n  "clips": [\n    {\n      "title": "...",\n      "hook": "...",\n      "reason": "...",\n      "startSeconds": 0,\n      "endSeconds": 0,\n      "score": 0\n    }\n  ]\n}\n\nTranscript windows:\n${transcript}`;
+  return `You are ranking viral short-form clip candidates from a ${sourceLabel}.\n\nVideo title: ${meta?.title ?? "Unknown"}\nChannel: ${meta?.author ?? "Unknown"}\nDuration: ${meta?.durationSeconds ? formatTime(meta.durationSeconds) : "unknown"}\n\nRules:\n- Pick the 3 best standalone clips.\n- Determine natural clip lengths from the content itself; do not force a fixed duration.\n- Never cut off setup, payoff, or the final key sentence.\n- Favor strong hooks, tension, surprise, emotional payoff, concrete lessons, disagreement potential, and replay value.\n- Keep clips between 15 and 70 seconds when possible.\n- Prefer moments spread across the timeline rather than clustering near the start.\n- Return valid JSON only in this exact shape:\n{\n  "clips": [\n    {\n      "title": "...",\n      "hook": "...",\n      "reason": "...",\n      "startSeconds": 0,\n      "endSeconds": 0,\n      "score": 0\n    }\n  ]\n}\n\nTimeline windows:\n${transcript}`;
 };
+
+// When the user only has a local file (no YouTube captions), build evenly
+// spaced timing windows from the file duration so AI still has a full-timeline
+// structure to rank against instead of inventing unbounded timestamps.
+const buildTimelineWindowsFromDuration = (durationSeconds: number): TranscriptWindow[] => {
+  const safeDuration = Math.max(30, Math.floor(durationSeconds) || 180);
+  const windowCount = Math.min(12, Math.max(4, Math.floor(safeDuration / 45)));
+  const windowLength = Math.max(18, Math.min(45, Math.floor(safeDuration / windowCount)));
+  const windows: TranscriptWindow[] = [];
+
+  for (let index = 0; index < windowCount; index += 1) {
+    const startSeconds = Math.min(safeDuration - 15, Math.floor((index / windowCount) * safeDuration));
+    const endSeconds = Math.min(safeDuration, startSeconds + windowLength);
+    if (endSeconds <= startSeconds) continue;
+    windows.push({
+      startSeconds,
+      endSeconds,
+      text: `Local video segment ${index + 1} from ${formatTime(startSeconds)} to ${formatTime(endSeconds)}. Look for a self-contained hook, tension, and payoff inside this range.`,
+    });
+  }
+
+  return windows.length > 0 ? windows : SAMPLE_WINDOWS;
+};
+
+const readUploadedVideoMeta = (file: File): Promise<VideoMeta> =>
+  new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+
+    const cleanup = () => {
+      video.removeAttribute("src");
+      video.load();
+      URL.revokeObjectURL(objectUrl);
+    };
+
+    const finish = (durationSeconds?: number) => {
+      cleanup();
+      resolve({
+        title: file.name.replace(/\.[^.]+$/, "") || "Uploaded video",
+        author: "Local upload",
+        thumbnailUrl: "",
+        videoId: "",
+        source: "upload",
+        durationSeconds,
+      });
+    };
+
+    video.onloadedmetadata = () => {
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
+      finish(duration);
+    };
+    video.onerror = () => finish(undefined);
+    video.src = objectUrl;
+  });
 
 async function fetchYouTubeTranscript(videoId: string): Promise<TranscriptWindow[] | null> {
   if (!videoId) return null;
@@ -321,6 +387,7 @@ async function fetchYouTubeMeta(videoId: string): Promise<VideoMeta | null> {
       author: data.author_name ?? "Unknown creator",
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
       videoId,
+      source: "youtube",
     };
   } catch {
     return {
@@ -328,6 +395,7 @@ async function fetchYouTubeMeta(videoId: string): Promise<VideoMeta | null> {
       author: "Unknown creator",
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
       videoId,
+      source: "youtube",
     };
   }
 }
@@ -389,7 +457,7 @@ export default function App() {
     if (typeof window === "undefined") return "light";
     return window.localStorage.getItem("clipcraft-theme") === "dark" ? "dark" : "light";
   });
-  const [youtubeUrl, setYoutubeUrl] = useState("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  const [youtubeUrl, setYoutubeUrl] = useState("");
   const [platform, setPlatform] = useState("shorts");
   const [captionPreset, setCaptionPreset] = useState("bold");
   const [stageIndex, setStageIndex] = useState(-1);
@@ -397,10 +465,11 @@ export default function App() {
   const [clips, setClips] = useState<Clip[]>([]);
   const [error, setError] = useState("");
   const [videoMeta, setVideoMeta] = useState<VideoMeta | null>(null);
-  const [aiSummary, setAiSummary] = useState("AI will analyze transcript windows to find the moments most likely to hold attention, trigger comments, and deliver a clean payoff.");
+  const [aiSummary, setAiSummary] = useState("AI will analyze a YouTube link or an uploaded video timeline to find the moments most likely to hold attention, trigger comments, and deliver a clean payoff.");
   const [renderState, setRenderState] = useState<Record<number, "idle" | "rendering" | "error">>({});
   const [renderErrors, setRenderErrors] = useState<Record<number, string>>({});
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [uploadedPreviewUrl, setUploadedPreviewUrl] = useState("");
   const [uploadRenderState, setUploadRenderState] = useState<Record<number, "idle" | "rendering" | "error">>({});
   const [uploadRenderErrors, setUploadRenderErrors] = useState<Record<number, string>>({});
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
@@ -416,12 +485,42 @@ export default function App() {
     window.localStorage.setItem("clipcraft-theme", theme);
   }
 
+  const hasYouTubeLink = isYouTubeUrl(youtubeUrl);
+  const hasUploadedFile = Boolean(uploadedFile);
+  const canGenerate = hasYouTubeLink || hasUploadedFile;
+  const analysisSource: "youtube" | "upload" | null = hasUploadedFile && !hasYouTubeLink
+    ? "upload"
+    : hasYouTubeLink
+      ? "youtube"
+      : hasUploadedFile
+        ? "upload"
+        : null;
+  const activeStages = analysisSource === "upload" ? UPLOAD_STAGES : YOUTUBE_STAGES;
+
   const progress = useMemo(() => {
     if (!isProcessing) return clips.length > 0 ? 100 : 0;
-    return Math.round(((stageIndex + 1) / STAGES.length) * 100);
-  }, [clips.length, isProcessing, stageIndex]);
+    return Math.round(((stageIndex + 1) / activeStages.length) * 100);
+  }, [activeStages.length, clips.length, isProcessing, stageIndex]);
 
-  const currentVideoId = useMemo(() => getVideoId(youtubeUrl), [youtubeUrl]);
+  const currentVideoId = useMemo(() => (hasYouTubeLink ? getVideoId(youtubeUrl) : ""), [hasYouTubeLink, youtubeUrl]);
+
+  const clearUploadedFile = () => {
+    setUploadedFile(null);
+    setUploadedPreviewUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return "";
+    });
+    if (uploadInputRef.current) uploadInputRef.current.value = "";
+  };
+
+  const handleUploadSelected = (file: File | null) => {
+    setUploadedPreviewUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return file ? URL.createObjectURL(file) : "";
+    });
+    setUploadedFile(file);
+    setError("");
+  };
 
   const buildClipCards = (candidates: AICandidate[], timingWindows: TranscriptWindow[]) => {
     return candidates.map((candidate, index) => {
@@ -446,10 +545,12 @@ export default function App() {
     const payload = {
       exportedAt: new Date().toISOString(),
       video: {
-        sourceUrl: youtubeUrl,
-        videoId: currentVideoId,
-        title: videoMeta?.title ?? "YouTube clip",
-        author: videoMeta?.author ?? "Unknown creator",
+        source: videoMeta?.source ?? (currentVideoId ? "youtube" : "upload"),
+        sourceUrl: currentVideoId ? youtubeUrl : uploadedFile?.name ?? "",
+        videoId: currentVideoId || null,
+        title: videoMeta?.title ?? uploadedFile?.name ?? "Clip source",
+        author: videoMeta?.author ?? (uploadedFile ? "Local upload" : "Unknown creator"),
+        durationSeconds: videoMeta?.durationSeconds ?? null,
       },
       clip: {
         title: clip.title,
@@ -465,10 +566,10 @@ export default function App() {
         format: clip.format,
         captionStyle: clip.captionStyle,
         transcriptExcerpt: clip.transcriptExcerpt,
-        previewUrl: getClipEmbedUrl(currentVideoId, clip),
+        previewUrl: currentVideoId ? getClipEmbedUrl(currentVideoId, clip) : null,
         youtubeUrl: currentVideoId
           ? `https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`
-          : youtubeUrl,
+          : null,
       },
     };
 
@@ -476,54 +577,20 @@ export default function App() {
     downloadBlob(blob, `${slugify(clip.title)}-clip-brief.json`);
   };
 
-  const handleRenderClip = async (clip: Clip) => {
-    setRenderState((prev) => ({ ...prev, [clip.id]: "rendering" }));
-    setRenderErrors((prev) => {
-      const next = { ...prev };
-      delete next[clip.id];
-      return next;
-    });
-
-    try {
-      const response = await fetch("/api/clip/render", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: youtubeUrl,
-          startSeconds: clip.startSeconds,
-          endSeconds: clip.endSeconds,
-        }),
-      });
-
-      if (!response.ok) {
-        let message = `Rendering failed (${response.status}).`;
-        try {
-          const body = await response.json();
-          if (body?.error) message = body.error;
-        } catch {
-          // response wasn't JSON, keep the generic message
-        }
-        throw new Error(message);
-      }
-
-      const blob = await response.blob();
-      downloadBlob(blob, `${slugify(clip.title)}.mp4`);
-      setRenderState((prev) => ({ ...prev, [clip.id]: "idle" }));
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Clip rendering failed.";
-      setRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
-      setRenderErrors((prev) => ({ ...prev, [clip.id]: message }));
-    }
-  };
-
-  // Trims the clip directly from a user-uploaded copy of the source video.
-  // This never touches YouTube's servers, so it works even when YouTube's
-  // bot-check blocks server-side downloads for the datacenter path above.
+  // Trims the clip directly from a user-uploaded source video. This never
+  // touches YouTube's servers, so it works for upload-only sessions and as a
+  // reliable fallback when YouTube bot-checks the datacenter download path.
   const handleRenderFromUpload = async (clip: Clip) => {
     if (!uploadedFile) return;
 
     setUploadRenderState((prev) => ({ ...prev, [clip.id]: "rendering" }));
+    setRenderState((prev) => ({ ...prev, [clip.id]: "rendering" }));
     setUploadRenderErrors((prev) => {
+      const next = { ...prev };
+      delete next[clip.id];
+      return next;
+    });
+    setRenderErrors((prev) => {
       const next = { ...prev };
       delete next[clip.id];
       return next;
@@ -563,30 +630,146 @@ export default function App() {
       const blob = await response.blob();
       downloadBlob(blob, `${slugify(clip.title)}.mp4`);
       setUploadRenderState((prev) => ({ ...prev, [clip.id]: "idle" }));
+      setRenderState((prev) => ({ ...prev, [clip.id]: "idle" }));
     } catch (err) {
       const message = err instanceof Error ? err.message : "Rendering from the uploaded file failed.";
       setUploadRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
+      setRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
       setUploadRenderErrors((prev) => ({ ...prev, [clip.id]: message }));
+      setRenderErrors((prev) => ({ ...prev, [clip.id]: message }));
+    }
+  };
+
+  const handleRenderClip = async (clip: Clip) => {
+    // Upload-first: if a local file is present, always render from it. A
+    // YouTube link is optional and not required once the source is uploaded.
+    if (uploadedFile) {
+      await handleRenderFromUpload(clip);
+      return;
+    }
+
+    if (!hasYouTubeLink) {
+      setRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
+      setRenderErrors((prev) => ({
+        ...prev,
+        [clip.id]: "Upload a video file or paste a YouTube link before rendering this clip.",
+      }));
+      return;
+    }
+
+    setRenderState((prev) => ({ ...prev, [clip.id]: "rendering" }));
+    setRenderErrors((prev) => {
+      const next = { ...prev };
+      delete next[clip.id];
+      return next;
+    });
+
+    try {
+      const response = await fetch("/api/clip/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: youtubeUrl,
+          startSeconds: clip.startSeconds,
+          endSeconds: clip.endSeconds,
+        }),
+      });
+
+      if (!response.ok) {
+        let message = `Rendering failed (${response.status}).`;
+        try {
+          const body = await response.json();
+          if (body?.error) message = body.error;
+        } catch {
+          // response wasn't JSON, keep the generic message
+        }
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      downloadBlob(blob, `${slugify(clip.title)}.mp4`);
+      setRenderState((prev) => ({ ...prev, [clip.id]: "idle" }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Clip rendering failed.";
+      setRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
+      setRenderErrors((prev) => ({ ...prev, [clip.id]: message }));
     }
   };
 
   const handleGenerate = async () => {
-    if (!isYouTubeUrl(youtubeUrl)) {
-      setError("Enter a valid YouTube link to analyze locally.");
+    if (!canGenerate) {
+      setError("Upload a video file or paste a YouTube link to analyze.");
       setClips([]);
       setIsProcessing(false);
       setStageIndex(-1);
       return;
     }
 
+    // Prefer the uploaded file when both are present only if the user didn't
+    // provide a valid YouTube URL — otherwise keep the richer caption path.
+    const useUploadOnly = Boolean(uploadedFile) && !hasYouTubeLink;
+
     setError("");
     setClips([]);
     setVideoMeta(null);
     setStageIndex(0);
     setIsProcessing(true);
-    setAiSummary("Loading metadata and transcript windows for AI scoring...");
+    setAiSummary(
+      useUploadOnly
+        ? "Reading the uploaded video and building timeline windows for AI scoring..."
+        : "Loading metadata and transcript windows for AI scoring...",
+    );
 
     try {
+      if (useUploadOnly && uploadedFile) {
+        if (uploadedFile.size > MAX_UPLOAD_BYTES) {
+          throw new Error(
+            `That file is ${formatFileSize(uploadedFile.size)} — larger than the ${formatFileSize(MAX_UPLOAD_BYTES)} limit for this preview. Trim the source file shorter, or lower its resolution, before uploading.`,
+          );
+        }
+
+        setStageIndex(1);
+        const meta = await readUploadedVideoMeta(uploadedFile);
+        setVideoMeta(meta);
+
+        setStageIndex(2);
+        setAiSummary("Building clip windows from the uploaded file timeline...");
+        const transcriptWindows = buildTimelineWindowsFromDuration(meta.durationSeconds ?? 180);
+
+        setStageIndex(3);
+        const prompt = buildPrompt(meta, transcriptWindows, "uploaded local video file");
+        const aiOutput = aiModel ? await complete(prompt) : "";
+
+        const parsed = parseAIClipPayload(aiOutput || "");
+        // Scale fallback sample timestamps into the uploaded file's duration so
+        // the UI still produces usable ranges without a YouTube link.
+        const duration = meta.durationSeconds ?? 180;
+        const fallbackCandidates = FALLBACK_CLIPS.map((candidate, index) => {
+          const span = Math.min(36, Math.max(18, Math.floor(duration / 5)));
+          const startSeconds = Math.min(
+            Math.max(0, Math.floor(duration * ((index + 1) / (FALLBACK_CLIPS.length + 1))) - Math.floor(span / 2)),
+            Math.max(0, Math.floor(duration) - span),
+          );
+          return {
+            ...candidate,
+            startSeconds,
+            endSeconds: startSeconds + span,
+          };
+        });
+        const candidates = parsed?.length ? parsed : fallbackCandidates;
+        const timingWindows = parsed?.length ? transcriptWindows : buildTimelineWindowsFromDuration(duration);
+
+        setStageIndex(4);
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        setClips(buildClipCards(candidates, timingWindows));
+        setAiSummary(
+          parsed?.length
+            ? "Claude Sonnet 5 scored the uploaded video's timeline and kept clip lengths flexible so each cut ends on a full idea. No YouTube link was needed."
+            : "AI scaffolding is active, and the UI fell back to local timeline moments from your uploaded file because a structured response was not available for this run.",
+        );
+        return;
+      }
+
       const meta = await fetchYouTubeMeta(currentVideoId);
       setVideoMeta(meta);
       setStageIndex(1);
@@ -599,7 +782,7 @@ export default function App() {
         : SAMPLE_WINDOWS;
       setStageIndex(2);
 
-      const prompt = buildPrompt(meta, transcriptWindows);
+      const prompt = buildPrompt(meta, transcriptWindows, "YouTube video transcript");
       setStageIndex(3);
       const aiOutput = aiModel ? await complete(prompt) : "";
 
@@ -680,10 +863,10 @@ export default function App() {
               </Badge>
               <div className="space-y-4">
                 <h1 className="max-w-3xl text-4xl font-semibold tracking-tight sm:text-5xl lg:text-6xl">
-                  Find <span className="text-primary">viral YouTube moments</span> and size every clip to the moment itself.
+                  Find <span className="text-primary">viral moments</span> from a link or an uploaded video.
                 </h1>
                 <p className="max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-                  This local-first app no longer treats clip length as a fixed input. Instead, it scores transcript windows, preserves the full setup and payoff, and opens real YouTube preview renders for each suggested segment.
+                  Paste a YouTube URL or upload a video file you own. AI ranks the best complete moments, sizes each clip to the payoff, and lets you preview and download without forcing both inputs.
                 </p>
               </div>
 
@@ -701,7 +884,7 @@ export default function App() {
                 <MagicCard className="rounded-3xl border border-border/60 bg-card/80 p-5 shadow-sm">
                   <p className="text-sm text-muted-foreground">Preview mode</p>
                   <p className="mt-3 text-3xl font-semibold tracking-tight"><NumberTicker value={100} />%</p>
-                  <p className="mt-2 text-sm text-muted-foreground">Embedded YouTube preview now opens per clip with exact start/end times.</p>
+                  <p className="mt-2 text-sm text-muted-foreground">YouTube embeds or local uploaded-file previews open per clip with exact start/end times.</p>
                 </MagicCard>
               </div>
             </BlurFade>
@@ -714,7 +897,7 @@ export default function App() {
                     <div>
                       <CardTitle className="text-2xl tracking-tight">Clip session</CardTitle>
                       <CardDescription>
-                        Analyze a YouTube link, let AI identify viral segments, and preview each cut locally before building the real ffmpeg pipeline.
+                        Upload a video file or paste a YouTube link. AI identifies viral segments and lets you preview and download each cut — a link is optional once a file is uploaded.
                       </CardDescription>
                     </div>
                     <div className="rounded-2xl border border-border/70 bg-secondary px-3 py-2 text-right text-sm">
@@ -724,29 +907,13 @@ export default function App() {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-5">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium">YouTube link</label>
-                    <Input
-                      value={youtubeUrl}
-                      onChange={(event) => setYoutubeUrl(event.target.value)}
-                      placeholder="https://www.youtube.com/watch?v=..."
-                      className="h-12 rounded-2xl border-border/70 bg-background/80"
-                    />
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      Use only videos you own or are authorized to repurpose. AI scoring now reads this video's real captions when they're available.
-                    </p>
-                  </div>
-
-                  <div className="space-y-2 rounded-2xl border border-dashed border-border/70 bg-background/60 p-4">
+                  <div className="space-y-2 rounded-2xl border border-dashed border-primary/25 bg-primary/5 p-4">
                     <div className="flex items-center justify-between gap-3">
-                      <label className="text-sm font-medium">Source video file (optional)</label>
+                      <label className="text-sm font-medium">Video file</label>
                       {uploadedFile ? (
                         <button
                           type="button"
-                          onClick={() => {
-                            setUploadedFile(null);
-                            if (uploadInputRef.current) uploadInputRef.current.value = "";
-                          }}
+                          onClick={clearUploadedFile}
                           className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
                         >
                           <X className="size-3" />
@@ -759,7 +926,7 @@ export default function App() {
                       type="file"
                       accept="video/*"
                       className="hidden"
-                      onChange={(event) => setUploadedFile(event.target.files?.[0] ?? null)}
+                      onChange={(event) => handleUploadSelected(event.target.files?.[0] ?? null)}
                     />
                     <Button
                       type="button"
@@ -768,12 +935,30 @@ export default function App() {
                       onClick={() => uploadInputRef.current?.click()}
                     >
                       <Upload className="size-4" />
-                      {uploadedFile ? uploadedFile.name : "Upload your own copy of this video"}
+                      {uploadedFile ? uploadedFile.name : "Upload a video to analyze"}
                     </Button>
                     <p className="text-xs leading-5 text-muted-foreground">
                       {uploadedFile
-                        ? `${formatFileSize(uploadedFile.size)} ready. Each clip's preview will offer "Trim uploaded file" as a reliable download that never touches YouTube's servers.`
-                        : "YouTube blocks server-side downloads from most cloud hosts. Upload a file you own the rights to and clips render straight from it instead."}
+                        ? `${formatFileSize(uploadedFile.size)} ready. You can generate clips and download trims from this file alone — no YouTube link required.`
+                        : "Upload a file you own the rights to. Once it's here, analysis and downloads work without a YouTube link."}
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">YouTube link <span className="font-normal text-muted-foreground">(optional if a file is uploaded)</span></label>
+                    <Input
+                      value={youtubeUrl}
+                      onChange={(event) => {
+                        setYoutubeUrl(event.target.value);
+                        setError("");
+                      }}
+                      placeholder="https://www.youtube.com/watch?v=..."
+                      className="h-12 rounded-2xl border-border/70 bg-background/80"
+                    />
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {uploadedFile
+                        ? "Optional. Leave blank to analyze and render from the uploaded file only. Add a link if you also want captions and YouTube embeds."
+                        : "Optional if you upload a video below. Use only videos you own or are authorized to repurpose."}
                     </p>
                   </div>
 
@@ -820,7 +1005,7 @@ export default function App() {
                       background="var(--color-primary)"
                       shimmerColor="#ffffff"
                       onClick={handleGenerate}
-                      disabled={isProcessing || isAILoading}
+                      disabled={isProcessing || isAILoading || !canGenerate}
                     >
                       <span className="inline-flex items-center gap-2 text-primary-foreground">
                         {isProcessing || isAILoading ? <LoaderCircle className="size-4 animate-spin" /> : <WandSparkles className="size-4" />}
@@ -836,7 +1021,9 @@ export default function App() {
                         setIsProcessing(false);
                         setStageIndex(-1);
                         setVideoMeta(null);
-                        setAiSummary("AI will analyze transcript windows to find the moments most likely to hold attention, trigger comments, and deliver a clean payoff.");
+                        setYoutubeUrl("");
+                        clearUploadedFile();
+                        setAiSummary("AI will analyze a YouTube link or an uploaded video timeline to find the moments most likely to hold attention, trigger comments, and deliver a clean payoff.");
                       }}
                     >
                       Reset session
@@ -870,7 +1057,7 @@ export default function App() {
                     </div>
                     <div className="space-y-3">
                       {isProcessing ? (
-                        STAGES.map((stage, index) => {
+                        activeStages.map((stage, index) => {
                           const complete = index < stageIndex;
                           const current = index === stageIndex;
                           return (
@@ -981,7 +1168,7 @@ export default function App() {
                       <Film className="mb-4 size-10 text-muted-foreground" />
                       <h3 className="text-xl font-semibold tracking-tight">No clips generated yet</h3>
                       <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-                        This review gallery will show complete, AI-ranked moments and open a real embedded preview for every selected clip.
+                        Upload a video or paste a YouTube link, then run AI analysis. Ranked moments will appear here with local or embedded previews.
                       </p>
                     </div>
                   ) : (
@@ -991,6 +1178,8 @@ export default function App() {
                           <div className="relative overflow-hidden rounded-[20px] border border-primary/15 bg-[linear-gradient(180deg,rgba(66,112,240,0.18),rgba(66,112,240,0.04))]">
                             {videoMeta?.thumbnailUrl ? (
                               <img src={videoMeta.thumbnailUrl} alt={videoMeta.title} className="aspect-[9/16] w-full object-cover opacity-70" />
+                            ) : uploadedPreviewUrl ? (
+                              <video src={uploadedPreviewUrl} className="aspect-[9/16] w-full object-cover opacity-70" muted playsInline preload="metadata" />
                             ) : (
                               <div className="aspect-[9/16] bg-muted/70" />
                             )}
@@ -1035,7 +1224,7 @@ export default function App() {
                                 <DialogHeader className="border-b border-border/70 px-6 py-5 text-left">
                                   <DialogTitle className="text-xl tracking-tight">{clip.title}</DialogTitle>
                                   <DialogDescription>
-                                    {videoMeta?.title ?? "YouTube clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
+                                    {videoMeta?.title ?? uploadedFile?.name ?? "Clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
                                   </DialogDescription>
                                 </DialogHeader>
                                 <div>
@@ -1051,8 +1240,17 @@ export default function App() {
                                             referrerPolicy="strict-origin-when-cross-origin"
                                             allowFullScreen
                                           />
+                                        ) : uploadedPreviewUrl ? (
+                                          <video
+                                            key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}-local`}
+                                            src={`${uploadedPreviewUrl}#t=${Math.max(0, Math.floor(clip.startSeconds))},${Math.max(Math.ceil(clip.endSeconds), Math.floor(clip.startSeconds) + 1)}`}
+                                            className="h-full w-full"
+                                            controls
+                                            playsInline
+                                            preload="metadata"
+                                          />
                                         ) : (
-                                          <div className="flex h-full w-full items-center justify-center text-white/70">Preview unavailable</div>
+                                          <div className="flex h-full w-full items-center justify-center text-white/70">Upload a video or add a YouTube link to preview this clip.</div>
                                         )}
                                     </div>
                                     <div className="bg-background">
@@ -1084,7 +1282,11 @@ export default function App() {
                                           </div>
                                         </div>
                                         <div className="rounded-2xl border border-primary/15 bg-primary/6 p-4 text-sm text-muted-foreground">
-                                          This preview now uses a real YouTube embed with exact `start` and `end` parameters, so the review flow is working instead of being a dead button.
+                                          {currentVideoId
+                                            ? "This preview uses a real YouTube embed with exact start and end parameters."
+                                            : uploadedFile
+                                              ? "This preview plays your uploaded file locally. No YouTube link is required to review or download the cut."
+                                              : "Add a YouTube link or upload a video file to preview this clip."}
                                         </div>
                                       </div>
                                       <div className="border-t border-border/70 bg-background/95 px-6 py-4">
@@ -1092,96 +1294,75 @@ export default function App() {
                                           <Button
                                             className="h-11 flex-1 rounded-2xl"
                                             onClick={() => handleRenderClip(clip)}
-                                            disabled={renderState[clip.id] === "rendering"}
+                                            disabled={renderState[clip.id] === "rendering" || uploadRenderState[clip.id] === "rendering" || (!uploadedFile && !hasYouTubeLink)}
                                           >
-                                            {renderState[clip.id] === "rendering" ? (
+                                            {renderState[clip.id] === "rendering" || uploadRenderState[clip.id] === "rendering" ? (
                                               <span className="inline-flex items-center gap-2">
                                                 <LoaderCircle className="size-4 animate-spin" />
-                                                Rendering clip…
+                                                {uploadedFile ? "Trimming uploaded file…" : "Rendering clip…"}
+                                              </span>
+                                            ) : uploadedFile ? (
+                                              <span className="inline-flex items-center gap-2">
+                                                <Upload className="size-4" />
+                                                Trim uploaded file & download
                                               </span>
                                             ) : (
                                               "Render & download clip"
                                             )}
                                           </Button>
-                                          <Button asChild variant="outline" className="h-11 flex-1 rounded-2xl border-border/70 bg-background/80">
-                                            <a href={`https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`} target="_blank" rel="noreferrer noopener">
-                                              Open on YouTube
-                                            </a>
-                                          </Button>
+                                          {currentVideoId ? (
+                                            <Button asChild variant="outline" className="h-11 flex-1 rounded-2xl border-border/70 bg-background/80">
+                                              <a href={`https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`} target="_blank" rel="noreferrer noopener">
+                                                Open on YouTube
+                                              </a>
+                                            </Button>
+                                          ) : null}
                                         </div>
 
-                                        {renderState[clip.id] === "error" ? (
+                                        {renderState[clip.id] === "error" || uploadRenderState[clip.id] === "error" ? (
                                           <div className="mt-3 flex items-start gap-2 rounded-2xl border border-destructive/20 bg-destructive/10 p-3 text-xs text-destructive">
                                             <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
                                             <div>
-                                              <p>{renderErrors[clip.id] ?? "Clip rendering failed."}</p>
+                                              <p>{uploadRenderErrors[clip.id] ?? renderErrors[clip.id] ?? "Clip rendering failed."}</p>
                                               {!uploadedFile ? (
                                                 <button
                                                   type="button"
                                                   onClick={() => uploadInputRef.current?.click()}
                                                   className="mt-1 font-medium underline underline-offset-2"
                                                 >
-                                                  Upload your own copy of this video instead
+                                                  Upload a video file instead
                                                 </button>
                                               ) : null}
                                             </div>
                                           </div>
                                         ) : (
                                           <p className="mt-2 text-xs text-muted-foreground">
-                                            Downloads a real cut of the video, re-encoded to this clip's exact start and end time.
+                                            {uploadedFile
+                                              ? "Trims directly from your uploaded file — no YouTube link required."
+                                              : "Downloads a real cut of the video, re-encoded to this clip's exact start and end time."}
                                           </p>
                                         )}
 
-                                        <Separator className="my-4" />
-
-                                        {uploadedFile ? (
+                                        {!uploadedFile && hasYouTubeLink ? (
                                           <>
-                                            <Button
-                                              variant="secondary"
-                                              className="h-11 w-full rounded-2xl"
-                                              onClick={() => handleRenderFromUpload(clip)}
-                                              disabled={uploadRenderState[clip.id] === "rendering"}
-                                            >
-                                              {uploadRenderState[clip.id] === "rendering" ? (
-                                                <span className="inline-flex items-center gap-2">
-                                                  <LoaderCircle className="size-4 animate-spin" />
-                                                  Trimming {uploadedFile.name}…
-                                                </span>
-                                              ) : (
-                                                <span className="inline-flex items-center gap-2">
-                                                  <Upload className="size-4" />
-                                                  Trim uploaded file & download
-                                                </span>
-                                              )}
-                                            </Button>
-                                            {uploadRenderState[clip.id] === "error" ? (
-                                              <div className="mt-3 flex items-start gap-2 rounded-2xl border border-destructive/20 bg-destructive/10 p-3 text-xs text-destructive">
-                                                <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
-                                                <p>{uploadRenderErrors[clip.id] ?? "Rendering from the uploaded file failed."}</p>
-                                              </div>
-                                            ) : (
-                                              <p className="mt-2 text-xs text-muted-foreground">
-                                                Trims directly from your uploaded file — never touches YouTube's servers, so it works even when the option above is blocked.
+                                            <Separator className="my-4" />
+                                            <div className="flex items-center justify-between gap-3 rounded-2xl border border-dashed border-border/70 bg-background/60 p-3">
+                                              <p className="text-xs leading-5 text-muted-foreground">
+                                                If YouTube blocks the download above, upload your own copy of this video to trim it reliably — no link required after that.
                                               </p>
-                                            )}
+                                              <Button
+                                                type="button"
+                                                variant="outline"
+                                                size="sm"
+                                                className="h-8 shrink-0 rounded-xl border-border/70 bg-background/80 text-xs"
+                                                onClick={() => uploadInputRef.current?.click()}
+                                              >
+                                                <Upload className="mr-1.5 size-3.5" />
+                                                Upload video
+                                              </Button>
+                                            </div>
                                           </>
-                                        ) : (
-                                          <div className="flex items-center justify-between gap-3 rounded-2xl border border-dashed border-border/70 bg-background/60 p-3">
-                                            <p className="text-xs leading-5 text-muted-foreground">
-                                              If YouTube blocks the download above, upload your own copy of this video to trim it reliably.
-                                            </p>
-                                            <Button
-                                              type="button"
-                                              variant="outline"
-                                              size="sm"
-                                              className="h-8 shrink-0 rounded-xl border-border/70 bg-background/80 text-xs"
-                                              onClick={() => uploadInputRef.current?.click()}
-                                            >
-                                              <Upload className="mr-1.5 size-3.5" />
-                                              Upload video
-                                            </Button>
-                                          </div>
-                                        )}
+                                        ) : null}
 
                                         <div className="mt-3 flex items-center justify-end">
                                           <button
