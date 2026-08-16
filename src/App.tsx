@@ -426,31 +426,10 @@ const parseAIClipPayload = (raw: string): AICandidate[] | null => {
 
 const slugify = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "clip";
 
-// Server-rendering needs raw bytes, but the dev/prod API proxy already reads
-// every request body as JSON — sending the file as a base64 string keeps the
-// upload path on the exact same request/response shape as every other route
-// in this app instead of introducing a separate multipart parser.
-const fileToBase64 = (file: File): Promise<string> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const commaIndex = result.indexOf(",");
-      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
-    };
-    reader.onerror = () => reject(reader.error ?? new Error("Could not read the selected file."));
-    reader.readAsDataURL(file);
-  });
-
 const formatFileSize = (bytes: number) => {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
-
-// Vercel serverless functions cap request bodies to a few MB; base64 also
-// inflates size ~33%. This client-side cap fails fast with a clear message
-// instead of letting a large upload silently 413 on the server.
-const MAX_UPLOAD_BYTES = 60 * 1024 * 1024;
 
 export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -472,6 +451,7 @@ export default function App() {
   const [uploadedPreviewUrl, setUploadedPreviewUrl] = useState("");
   const [uploadRenderState, setUploadRenderState] = useState<Record<number, "idle" | "rendering" | "error">>({});
   const [uploadRenderErrors, setUploadRenderErrors] = useState<Record<number, string>>({});
+  const [uploadRenderStatus, setUploadRenderStatus] = useState<Record<number, string>>({});
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const aiModel = import.meta.env.VITE_AI_AGENT_ID;
@@ -577,14 +557,15 @@ export default function App() {
     downloadBlob(blob, `${slugify(clip.title)}-clip-brief.json`);
   };
 
-  // Trims the clip directly from a user-uploaded source video. This never
-  // touches YouTube's servers, so it works for upload-only sessions and as a
-  // reliable fallback when YouTube bot-checks the datacenter download path.
+  // Trims the clip in the browser with ffmpeg.wasm. The full file never leaves
+  // the device, so large uploads (100 MB+) work without the old 60 MB server
+  // body cap — and YouTube is never contacted.
   const handleRenderFromUpload = async (clip: Clip) => {
     if (!uploadedFile) return;
 
     setUploadRenderState((prev) => ({ ...prev, [clip.id]: "rendering" }));
     setRenderState((prev) => ({ ...prev, [clip.id]: "rendering" }));
+    setUploadRenderStatus((prev) => ({ ...prev, [clip.id]: "Starting local trim…" }));
     setUploadRenderErrors((prev) => {
       const next = { ...prev };
       delete next[clip.id];
@@ -597,44 +578,34 @@ export default function App() {
     });
 
     try {
-      if (uploadedFile.size > MAX_UPLOAD_BYTES) {
-        throw new Error(
-          `That file is ${formatFileSize(uploadedFile.size)} — larger than the ${formatFileSize(MAX_UPLOAD_BYTES)} limit for this preview. Trim the source file shorter, or lower its resolution, before uploading.`,
-        );
-      }
-
-      const fileBase64 = await fileToBase64(uploadedFile);
-      const response = await fetch("/api/clip/render-upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileBase64,
-          mimeType: uploadedFile.type || "video/mp4",
-          startSeconds: clip.startSeconds,
-          endSeconds: clip.endSeconds,
-          title: clip.title,
-        }),
+      // Lazy-load ffmpeg.wasm only when the user actually trims a clip.
+      const { trimVideoInBrowser } = await import("@/lib/client-trim");
+      const blob = await trimVideoInBrowser({
+        file: uploadedFile,
+        startSeconds: clip.startSeconds,
+        endSeconds: clip.endSeconds,
+        onStatus: (message) => {
+          setUploadRenderStatus((prev) => ({ ...prev, [clip.id]: message }));
+        },
       });
 
-      if (!response.ok) {
-        let message = `Rendering from the uploaded file failed (${response.status}).`;
-        try {
-          const body = await response.json();
-          if (body?.error) message = body.error;
-        } catch {
-          // response wasn't JSON, keep the generic message
-        }
-        throw new Error(message);
-      }
-
-      const blob = await response.blob();
       downloadBlob(blob, `${slugify(clip.title)}.mp4`);
       setUploadRenderState((prev) => ({ ...prev, [clip.id]: "idle" }));
       setRenderState((prev) => ({ ...prev, [clip.id]: "idle" }));
+      setUploadRenderStatus((prev) => {
+        const next = { ...prev };
+        delete next[clip.id];
+        return next;
+      });
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Rendering from the uploaded file failed.";
+      const message = err instanceof Error ? err.message : "Local trim failed.";
       setUploadRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
       setRenderState((prev) => ({ ...prev, [clip.id]: "error" }));
+      setUploadRenderStatus((prev) => {
+        const next = { ...prev };
+        delete next[clip.id];
+        return next;
+      });
       setUploadRenderErrors((prev) => ({ ...prev, [clip.id]: message }));
       setRenderErrors((prev) => ({ ...prev, [clip.id]: message }));
     }
@@ -722,12 +693,8 @@ export default function App() {
 
     try {
       if (useUploadOnly && uploadedFile) {
-        if (uploadedFile.size > MAX_UPLOAD_BYTES) {
-          throw new Error(
-            `That file is ${formatFileSize(uploadedFile.size)} — larger than the ${formatFileSize(MAX_UPLOAD_BYTES)} limit for this preview. Trim the source file shorter, or lower its resolution, before uploading.`,
-          );
-        }
-
+        // Analysis only needs metadata + timeline windows. Trimming runs
+        // client-side, so large files (100 MB+) are fully supported.
         setStageIndex(1);
         const meta = await readUploadedVideoMeta(uploadedFile);
         setVideoMeta(meta);
@@ -939,8 +906,8 @@ export default function App() {
                     </Button>
                     <p className="text-xs leading-5 text-muted-foreground">
                       {uploadedFile
-                        ? `${formatFileSize(uploadedFile.size)} ready. You can generate clips and download trims from this file alone — no YouTube link required.`
-                        : "Upload a file you own the rights to. Once it's here, analysis and downloads work without a YouTube link."}
+                        ? `${formatFileSize(uploadedFile.size)} ready on this device. Clips are trimmed in your browser — large files are fine, nothing is uploaded to a server.`
+                        : "Upload a file you own the rights to. Trimming runs in your browser, so large videos (100 MB+) work without a server size limit."}
                     </p>
                   </div>
 
@@ -1299,12 +1266,12 @@ export default function App() {
                                             {renderState[clip.id] === "rendering" || uploadRenderState[clip.id] === "rendering" ? (
                                               <span className="inline-flex items-center gap-2">
                                                 <LoaderCircle className="size-4 animate-spin" />
-                                                {uploadedFile ? "Trimming uploaded file…" : "Rendering clip…"}
+                                                {uploadedFile ? "Trimming in browser…" : "Rendering clip…"}
                                               </span>
                                             ) : uploadedFile ? (
                                               <span className="inline-flex items-center gap-2">
-                                                <Upload className="size-4" />
-                                                Trim uploaded file & download
+                                                <Scissors className="size-4" />
+                                                Trim locally & download
                                               </span>
                                             ) : (
                                               "Render & download clip"
@@ -1335,10 +1302,12 @@ export default function App() {
                                               ) : null}
                                             </div>
                                           </div>
+                                        ) : uploadRenderState[clip.id] === "rendering" && uploadRenderStatus[clip.id] ? (
+                                          <p className="mt-2 text-xs text-muted-foreground">{uploadRenderStatus[clip.id]}</p>
                                         ) : (
                                           <p className="mt-2 text-xs text-muted-foreground">
                                             {uploadedFile
-                                              ? "Trims directly from your uploaded file — no YouTube link required."
+                                              ? "Trims in your browser from the local file — large videos are supported, nothing is sent to a server."
                                               : "Downloads a real cut of the video, re-encoded to this clip's exact start and end time."}
                                           </p>
                                         )}

@@ -83,7 +83,10 @@ function aiProxyPlugin(): Plugin {
 }
 
 export default defineConfig({
-  optimizeDeps: { exclude: ["@electric-sql/pglite"] },
+  // pglite + ffmpeg.wasm ship their own workers/wasm and break if Vite
+  // prebundles them into the dep optimizer.
+  optimizeDeps: { exclude: ["@electric-sql/pglite", "@ffmpeg/ffmpeg", "@ffmpeg/util"] },
+  worker: { format: "es" },
   // `aiProxyPlugin` stays because it streams Server-Sent Events directly
   // (res.write per chunk) — the generic api router below buffers full
   // responses via ssrLoadModule + res.json()/res.send(), which doesn't fit a
