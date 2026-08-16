@@ -22,7 +22,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { detectSpeakerFocus, focusToObjectPosition } from "@/lib/face-focus";
+import {
+  detectSpeakerFocusTrack,
+  focusToObjectPosition,
+  focusTrackIsDynamic,
+  interpolateFocus,
+  type FocusKeyframe,
+} from "@/lib/face-focus";
 import { cn } from "@/lib/utils";
 
 export type PreviewClip = {
@@ -39,6 +45,8 @@ export type PreviewClip = {
   focusX: number;
   /** 0 = top, 1 = bottom. Where the horizontal crop window is locked. */
   focusY: number;
+  /** Time-varying speaker track (absolute source times). Empty = static focus. */
+  focusKeyframes: FocusKeyframe[];
   score: number;
   format: string;
   captionStyle: string;
@@ -60,7 +68,12 @@ type ClipPreviewDialogProps = {
   mediaDurationSeconds?: number;
   onUpdateTiming: (clipId: number, startSeconds: number, endSeconds: number) => void;
   onResetTiming: (clipId: number) => void;
-  onUpdateFocus: (clipId: number, focusX: number, focusY: number) => void;
+  onUpdateFocus: (
+    clipId: number,
+    focusX: number,
+    focusY: number,
+    focusKeyframes?: FocusKeyframe[] | null,
+  ) => void;
   onResetFocus: (clipId: number) => void;
   onRender: (clip: PreviewClip) => void;
   onDownloadBrief: (clip: PreviewClip) => void;
@@ -90,6 +103,8 @@ function LocalClipPlayer({
   endSeconds,
   focusX,
   focusY,
+  focusKeyframes,
+  onLiveFocus,
   className,
 }: {
   src: string;
@@ -97,12 +112,22 @@ function LocalClipPlayer({
   endSeconds: number;
   focusX: number;
   focusY: number;
+  focusKeyframes: FocusKeyframe[];
+  onLiveFocus?: (focusX: number, focusY: number) => void;
   className?: string;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const start = Math.max(0, startSeconds);
   const end = Math.max(start + 0.25, endSeconds);
-  const objectPosition = focusToObjectPosition(focusX, focusY);
+  const dynamic = focusTrackIsDynamic(focusKeyframes);
+  const [liveFocus, setLiveFocus] = useState({ focusX, focusY });
+
+  // Keep static focus in sync when the user drags sliders (no track / manual pan).
+  useEffect(() => {
+    if (dynamic) return;
+    setLiveFocus({ focusX, focusY });
+    onLiveFocus?.(focusX, focusY);
+  }, [focusX, focusY, dynamic, onLiveFocus]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -118,24 +143,45 @@ function LocalClipPlayer({
       }
     };
 
+    const publishFocus = (time: number) => {
+      if (!dynamic) {
+        setLiveFocus({ focusX, focusY });
+        onLiveFocus?.(focusX, focusY);
+        return;
+      }
+      const next = interpolateFocus(focusKeyframes, time, focusX, focusY);
+      setLiveFocus(next);
+      onLiveFocus?.(next.focusX, next.focusY);
+    };
+
     const onTimeUpdate = () => {
+      publishFocus(video.currentTime);
       if (video.currentTime >= end - 0.05) {
         video.pause();
         video.currentTime = end;
       }
     };
 
-    const onLoaded = () => seekToStart();
+    const onSeeked = () => publishFocus(video.currentTime);
+    const onLoaded = () => {
+      seekToStart();
+      publishFocus(start);
+    };
 
     video.addEventListener("loadedmetadata", onLoaded);
     video.addEventListener("timeupdate", onTimeUpdate);
+    video.addEventListener("seeked", onSeeked);
     seekToStart();
+    publishFocus(start);
 
     return () => {
       video.removeEventListener("loadedmetadata", onLoaded);
       video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("seeked", onSeeked);
     };
-  }, [src, start, end]);
+  }, [src, start, end, focusX, focusY, focusKeyframes, dynamic, onLiveFocus]);
+
+  const objectPosition = focusToObjectPosition(liveFocus.focusX, liveFocus.focusY);
 
   return (
     <video
@@ -158,6 +204,7 @@ function FocusPreview({
   endSeconds,
   focusX,
   focusY,
+  focusKeyframes,
   format,
   isYouTubeEmbed,
   embedUrl,
@@ -169,13 +216,21 @@ function FocusPreview({
   endSeconds: number;
   focusX: number;
   focusY: number;
+  focusKeyframes: FocusKeyframe[];
   format: string;
   isYouTubeEmbed: boolean;
   embedUrl?: string;
   title: string;
 }) {
   const frameClass = previewFrameClass(format);
-  const objectPosition = focusToObjectPosition(focusX, focusY);
+  const [overlayFocus, setOverlayFocus] = useState({ focusX, focusY });
+  const dynamic = focusTrackIsDynamic(focusKeyframes);
+
+  useEffect(() => {
+    setOverlayFocus({ focusX, focusY });
+  }, [focusX, focusY]);
+
+  const objectPosition = focusToObjectPosition(overlayFocus.focusX, overlayFocus.focusY);
 
   // YouTube embeds can't be object-positioned. Show a framed still/thumbnail
   // with the live focus overlay, plus a small note that export uses the pan.
@@ -209,8 +264,8 @@ function FocusPreview({
         )}
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-black/20" />
         <div
-          className="pointer-events-none absolute size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.4)]"
-          style={{ left: `${focusX * 100}%`, top: `${focusY * 100}%` }}
+          className="pointer-events-none absolute size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.4)] transition-[left,top] duration-150 ease-out"
+          style={{ left: `${overlayFocus.focusX * 100}%`, top: `${overlayFocus.focusY * 100}%` }}
         >
           <div className="absolute inset-1 rounded-full bg-white/30" />
         </div>
@@ -232,14 +287,21 @@ function FocusPreview({
           endSeconds={endSeconds}
           focusX={focusX}
           focusY={focusY}
+          focusKeyframes={focusKeyframes}
+          onLiveFocus={(x, y) => setOverlayFocus({ focusX: x, focusY: y })}
           className="absolute inset-0"
         />
         <div
-          className="pointer-events-none absolute size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.4)]"
-          style={{ left: `${focusX * 100}%`, top: `${focusY * 100}%` }}
+          className="pointer-events-none absolute size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.4)] transition-[left,top] duration-150 ease-out"
+          style={{ left: `${overlayFocus.focusX * 100}%`, top: `${overlayFocus.focusY * 100}%` }}
         >
           <div className="absolute inset-1 rounded-full bg-white/25" />
         </div>
+        {dynamic ? (
+          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/55 px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider text-white/80 backdrop-blur-sm">
+            Tracking speakers
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -295,20 +357,23 @@ export function ClipPreviewDialog({
     setEndDraft(formatTimePrecise(clip.endSeconds));
   }, [clip.startSeconds, clip.endSeconds, formatTimePrecise]);
 
-  // Auto-detect speaker focus once when the dialog opens with a local file
-  // and the user hasn't already panned away from center.
+  // Auto-detect speaker track once when the dialog opens with a local file
+  // and the user hasn't already panned away from center / set a track.
   useEffect(() => {
     if (!open || !uploadedPreviewUrl) return;
     const isDefaultFocus =
-      Math.abs(clip.focusX - 0.5) < FOCUS_EPS && Math.abs(clip.focusY - 0.5) < FOCUS_EPS;
+      Math.abs(clip.focusX - 0.5) < FOCUS_EPS &&
+      Math.abs(clip.focusY - 0.5) < FOCUS_EPS &&
+      !focusTrackIsDynamic(clip.focusKeyframes) &&
+      clip.focusKeyframes.length === 0;
     if (!isDefaultFocus) return;
 
     const controller = new AbortController();
     detectAbortRef.current = controller;
     setDetecting(true);
-    setDetectNote("Finding the speaker…");
+    setDetectNote("Tracking speakers across the clip…");
 
-    detectSpeakerFocus({
+    detectSpeakerFocusTrack({
       src: uploadedPreviewUrl,
       startSeconds: clip.startSeconds,
       endSeconds: clip.endSeconds,
@@ -320,12 +385,20 @@ export function ClipPreviewDialog({
           setDetectNote("Couldn't lock a face — drag the focus or use the sliders.");
           return;
         }
-        onUpdateFocus(clip.id, result.focusX, result.focusY);
-        setDetectNote(
-          result.source === "face-detector"
-            ? "Speaker locked from face detection."
-            : "Speaker locked from visual analysis.",
-        );
+        onUpdateFocus(clip.id, result.focusX, result.focusY, result.keyframes);
+        if (result.switches > 0 || focusTrackIsDynamic(result.keyframes)) {
+          setDetectNote(
+            result.source === "face-detector"
+              ? `Speaker track locked · follows ${result.switches + 1} turn${result.switches === 0 ? "" : "s"} across the clip.`
+              : `Speaker track locked from visual analysis · pans with turn-taking.`,
+          );
+        } else {
+          setDetectNote(
+            result.source === "face-detector"
+              ? "Speaker locked from face detection."
+              : "Speaker locked from visual analysis.",
+          );
+        }
       })
       .catch(() => {
         if (!controller.signal.aborted) {
@@ -340,7 +413,7 @@ export function ClipPreviewDialog({
       controller.abort();
       detectAbortRef.current = null;
     };
-    // Only re-run when the dialog opens or the source clip identity changes —
+    // Only re-run when the dialog opens or the source clip identity/range changes —
     // not on every focus tweak the user makes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, uploadedPreviewUrl, clip.id, clip.startSeconds, clip.endSeconds]);
@@ -362,7 +435,12 @@ export function ClipPreviewDialog({
     Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05;
 
   const isFocusEdited =
-    Math.abs(clip.focusX - 0.5) > FOCUS_EPS || Math.abs(clip.focusY - 0.5) > FOCUS_EPS;
+    Math.abs(clip.focusX - 0.5) > FOCUS_EPS ||
+    Math.abs(clip.focusY - 0.5) > FOCUS_EPS ||
+    focusTrackIsDynamic(clip.focusKeyframes) ||
+    clip.focusKeyframes.length > 0;
+
+  const isTracking = focusTrackIsDynamic(clip.focusKeyframes);
 
   const startPct = Math.min(100, Math.max(0, (clip.startSeconds / maxBound) * 100));
   const endPct = Math.min(100, Math.max(0, (clip.endSeconds / maxBound) * 100));
@@ -395,20 +473,20 @@ export function ClipPreviewDialog({
 
   const runDetect = async () => {
     if (!uploadedPreviewUrl) {
-      setDetectNote("Upload a video file to auto-detect the speaker.");
+      setDetectNote("Upload a video file to auto-detect speakers.");
       return;
     }
     detectAbortRef.current?.abort();
     const controller = new AbortController();
     detectAbortRef.current = controller;
     setDetecting(true);
-    setDetectNote("Scanning frames for a face…");
+    setDetectNote("Scanning frames and tracking who is on camera…");
     try {
-      const result = await detectSpeakerFocus({
+      const result = await detectSpeakerFocusTrack({
         src: uploadedPreviewUrl,
         startSeconds: clip.startSeconds,
         endSeconds: clip.endSeconds,
-        sampleCount: 6,
+        sampleCount: Math.min(24, Math.max(8, Math.round(clip.durationSeconds * 1.5))),
         signal: controller.signal,
       });
       if (controller.signal.aborted) return;
@@ -416,12 +494,20 @@ export function ClipPreviewDialog({
         setDetectNote("No clear face found — pan the focus manually.");
         return;
       }
-      onUpdateFocus(clip.id, result.focusX, result.focusY);
-      setDetectNote(
-        result.source === "face-detector"
-          ? "Speaker locked from face detection."
-          : "Speaker locked from visual analysis.",
-      );
+      onUpdateFocus(clip.id, result.focusX, result.focusY, result.keyframes);
+      if (result.switches > 0 || focusTrackIsDynamic(result.keyframes)) {
+        setDetectNote(
+          result.source === "face-detector"
+            ? `Tracking ${result.switches + 1} speaker turn${result.switches === 0 ? "" : "s"} · crop will pan on export.`
+            : `Visual track locked · crop pans with the active speaker.`,
+        );
+      } else {
+        setDetectNote(
+          result.source === "face-detector"
+            ? "Single speaker locked from face detection."
+            : "Single speaker locked from visual analysis.",
+        );
+      }
     } catch {
       if (!controller.signal.aborted) setDetectNote("Detection failed — pan manually.");
     } finally {
@@ -464,7 +550,11 @@ export function ClipPreviewDialog({
                   Manually trimmed
                 </Badge>
               ) : null}
-              {isFocusEdited ? (
+              {isTracking ? (
+                <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
+                  Speaker track
+                </Badge>
+              ) : isFocusEdited ? (
                 <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
                   Reframed
                 </Badge>
@@ -490,13 +580,16 @@ export function ClipPreviewDialog({
               endSeconds={clip.endSeconds}
               focusX={clip.focusX}
               focusY={clip.focusY}
+              focusKeyframes={clip.focusKeyframes}
               format={clip.format}
               isYouTubeEmbed={Boolean(currentVideoId) && !uploadedPreviewUrl}
               embedUrl={embedUrl}
               title={clip.title}
             />
             <p className="max-w-[280px] text-center text-xs leading-5 text-white/45">
-              Preview follows your speaker focus. Downloaded MP4s crop to the same point — not just the middle of the frame.
+              {isTracking
+                ? "Preview pans with the active speaker. Downloaded MP4s use the same moving crop."
+                : "Preview follows your speaker focus. Downloaded MP4s crop to the same point — not just the middle of the frame."}
             </p>
           </div>
 
@@ -671,7 +764,9 @@ export function ClipPreviewDialog({
                       Speaker focus
                     </p>
                     <p className="mt-0.5 text-xs text-muted-foreground">
-                      Shift the {clip.format} crop onto the person talking instead of dead-center.
+                      {isTracking
+                        ? "Auto-detect built a moving track so the crop follows whoever is talking."
+                        : `Shift the ${clip.format} crop onto the person talking instead of dead-center.`}
                     </p>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -688,7 +783,7 @@ export function ClipPreviewDialog({
                       ) : (
                         <ScanFace className="size-3.5" />
                       )}
-                      {detecting ? "Detecting…" : "Auto-detect"}
+                      {detecting ? "Tracking…" : "Auto-detect"}
                     </Button>
                     <Button
                       type="button"
@@ -716,6 +811,7 @@ export function ClipPreviewDialog({
                       <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
                         {clip.focusX < 0.4 ? "Left" : clip.focusX > 0.6 ? "Right" : "Center"} ·{" "}
                         {(clip.focusX * 100).toFixed(0)}%
+                        {isTracking ? " · track" : ""}
                       </span>
                     </div>
                     <input
@@ -728,7 +824,8 @@ export function ClipPreviewDialog({
                       aria-label="Horizontal focus"
                       className="h-2 w-full cursor-ew-resize appearance-none rounded-full bg-muted accent-primary"
                       onChange={(event) =>
-                        onUpdateFocus(clip.id, clamp01(Number(event.target.value)), clip.focusY)
+                        // Manual pan clears the dynamic track and locks a static point.
+                        onUpdateFocus(clip.id, clamp01(Number(event.target.value)), clip.focusY, [])
                       }
                     />
                     <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -744,6 +841,7 @@ export function ClipPreviewDialog({
                       <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
                         {clip.focusY < 0.4 ? "Up" : clip.focusY > 0.6 ? "Down" : "Middle"} ·{" "}
                         {(clip.focusY * 100).toFixed(0)}%
+                        {isTracking ? " · track" : ""}
                       </span>
                     </div>
                     <input
@@ -756,7 +854,7 @@ export function ClipPreviewDialog({
                       aria-label="Vertical focus"
                       className="h-2 w-full cursor-ns-resize appearance-none rounded-full bg-muted accent-primary"
                       onChange={(event) =>
-                        onUpdateFocus(clip.id, clip.focusX, clamp01(Number(event.target.value)))
+                        onUpdateFocus(clip.id, clip.focusX, clamp01(Number(event.target.value)), [])
                       }
                     />
                     <div className="flex justify-between text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -770,11 +868,15 @@ export function ClipPreviewDialog({
                   <p className="mt-3 text-[11px] leading-4 text-muted-foreground">{detectNote}</p>
                 ) : !uploadedPreviewUrl ? (
                   <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
-                    Upload a local video for auto face-lock. YouTube-only previews still honor the manual pan on export.
+                    Upload a local video for auto speaker-tracking. YouTube-only previews still honor the manual pan on export.
+                  </p>
+                ) : isTracking ? (
+                  <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
+                    Moving track active ({clip.focusKeyframes.length} keyframes). Drag a slider to override with a static lock.
                   </p>
                 ) : (
                   <p className="mt-3 text-[11px] leading-4 text-muted-foreground">
-                    Auto-detect samples frames in this trim range and locks onto the largest face.
+                    Auto-detect samples the trim range, tracks faces over time, and pans when the speaker changes.
                   </p>
                 )}
               </div>
@@ -863,7 +965,9 @@ export function ClipPreviewDialog({
               ) : (
                 <p className="mt-2 text-xs text-muted-foreground">
                   {hasUploadedFile
-                    ? `Exports a ${clip.format} MP4 from your local file using the trimmed range and speaker focus above.`
+                    ? isTracking
+                      ? `Exports a ${clip.format} MP4 with a moving crop that follows the speaker track.`
+                      : `Exports a ${clip.format} MP4 from your local file using the trimmed range and speaker focus above.`
                     : `Downloads a real cut re-encoded to ${clip.format} with your trim and speaker focus.`}
                 </p>
               )}
@@ -873,7 +977,7 @@ export function ClipPreviewDialog({
                   <Separator className="my-4" />
                   <div className="flex items-center justify-between gap-3 rounded-2xl border border-dashed border-border/70 bg-background/60 p-3">
                     <p className="text-xs leading-5 text-muted-foreground">
-                      Upload your own copy to auto-detect faces and trim more reliably if YouTube blocks the download.
+                      Upload your own copy to auto-track speakers and trim more reliably if YouTube blocks the download.
                     </p>
                     <Button
                       type="button"

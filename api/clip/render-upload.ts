@@ -63,8 +63,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const workDir = await mkdtemp(path.join(tmpdir(), "clipcraft-upload-"));
 
   try {
-    const { fileBase64, mimeType, startSeconds, endSeconds, title, aspect, focusX, focusY } =
-      req.body ?? {};
+    const {
+      fileBase64,
+      mimeType,
+      startSeconds,
+      endSeconds,
+      title,
+      aspect,
+      focusX,
+      focusY,
+      focusKeyframes,
+    } = req.body ?? {};
 
     if (typeof fileBase64 !== "string" || !fileBase64.trim()) {
       return res.status(400).json({ error: "No video file data was received." });
@@ -79,9 +88,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const resolvedAspect = resolveAspect(aspect);
     const fx = Number(focusX);
     const fy = Number(focusY);
+    const keyframes = Array.isArray(focusKeyframes)
+      ? focusKeyframes
+          .map((frame: { time?: unknown; focusX?: unknown; focusY?: unknown }) => ({
+            time: Number(frame?.time),
+            focusX: Number(frame?.focusX),
+            focusY: Number(frame?.focusY),
+          }))
+          .filter(
+            (frame: { time: number; focusX: number; focusY: number }) =>
+              Number.isFinite(frame.time) &&
+              Number.isFinite(frame.focusX) &&
+              Number.isFinite(frame.focusY),
+          )
+          .map((frame: { time: number; focusX: number; focusY: number }) => ({
+            time: Math.max(0, frame.time),
+            focusX: Math.min(1, Math.max(0, frame.focusX)),
+            focusY: Math.min(1, Math.max(0, frame.focusY)),
+          }))
+      : null;
     const vf = aspectVideoFilter(resolvedAspect, {
       focusX: Number.isFinite(fx) ? Math.min(1, Math.max(0, fx)) : 0.5,
       focusY: Number.isFinite(fy) ? Math.min(1, Math.max(0, fy)) : 0.5,
+      focusKeyframes: keyframes,
+      clipStartSeconds: start,
     });
 
     let sourceBuffer: Buffer;

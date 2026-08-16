@@ -21,7 +21,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { url, startSeconds, endSeconds, aspect, focusX, focusY } = req.body ?? {};
+    const { url, startSeconds, endSeconds, aspect, focusX, focusY, focusKeyframes } = req.body ?? {};
 
     if (typeof url !== "string" || !url.trim()) {
       return res.status(400).json({ error: "A YouTube url is required." });
@@ -35,6 +35,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const fx = Number(focusX);
     const fy = Number(focusY);
+    const keyframes = Array.isArray(focusKeyframes)
+      ? focusKeyframes
+          .map((frame: { time?: unknown; focusX?: unknown; focusY?: unknown }) => ({
+            time: Number(frame?.time),
+            focusX: Number(frame?.focusX),
+            focusY: Number(frame?.focusY),
+          }))
+          .filter(
+            (frame: { time: number; focusX: number; focusY: number }) =>
+              Number.isFinite(frame.time) &&
+              Number.isFinite(frame.focusX) &&
+              Number.isFinite(frame.focusY),
+          )
+          .map((frame: { time: number; focusX: number; focusY: number }) => ({
+            time: Math.max(0, frame.time),
+            focusX: Math.min(1, Math.max(0, frame.focusX)),
+            focusY: Math.min(1, Math.max(0, frame.focusY)),
+          }))
+      : null;
 
     const { buffer, filename } = await renderClip({
       url,
@@ -43,6 +62,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       aspect: resolveAspect(aspect),
       focusX: Number.isFinite(fx) ? Math.min(1, Math.max(0, fx)) : 0.5,
       focusY: Number.isFinite(fy) ? Math.min(1, Math.max(0, fy)) : 0.5,
+      focusKeyframes: keyframes,
     });
 
     res.writeHead(200, {

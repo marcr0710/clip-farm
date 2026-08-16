@@ -65,6 +65,8 @@ interface Clip {
   focusX: number;
   /** 0 = top, 1 = bottom. Crop window lock for speaker-aware framing. */
   focusY: number;
+  /** Time-varying speaker track (absolute source times). Empty = static focus. */
+  focusKeyframes: Array<{ time: number; focusX: number; focusY: number }>;
   score: number;
   format: string;
   captionStyle: string;
@@ -1136,9 +1138,10 @@ export default function App() {
         durationSeconds: timing.durationSeconds,
         originalStartSeconds: timing.startSeconds,
         originalEndSeconds: timing.endSeconds,
-        // Center until the user pans or auto face-detect locks a speaker.
+        // Center until the user pans or auto face-detect builds a speaker track.
         focusX: 0.5,
         focusY: 0.5,
+        focusKeyframes: [],
         score: Math.max(1, Math.min(99, Math.round(Number(candidate.score) || 80))),
         format: getFormatForPlatform(platform),
         captionStyle: getCaptionLabel(captionPreset),
@@ -1205,19 +1208,43 @@ export default function App() {
     return Math.min(1, Math.max(0, value));
   };
 
-  const updateClipFocus = (clipId: number, focusX: number, focusY: number) => {
+  const updateClipFocus = (
+    clipId: number,
+    focusX: number,
+    focusY: number,
+    focusKeyframes?: Array<{ time: number; focusX: number; focusY: number }> | null,
+  ) => {
     setClips((previous) =>
-      previous.map((clip) =>
-        clip.id === clipId
-          ? { ...clip, focusX: clampFocus(focusX), focusY: clampFocus(focusY) }
-          : clip,
-      ),
+      previous.map((clip) => {
+        if (clip.id !== clipId) return clip;
+        const nextKeyframes = Array.isArray(focusKeyframes)
+          ? focusKeyframes
+              .map((frame) => ({
+                time: Math.max(0, Number(frame.time) || 0),
+                focusX: clampFocus(frame.focusX),
+                focusY: clampFocus(frame.focusY),
+              }))
+              .sort((a, b) => a.time - b.time)
+          : focusKeyframes === null
+            ? []
+            : clip.focusKeyframes;
+        return {
+          ...clip,
+          focusX: clampFocus(focusX),
+          focusY: clampFocus(focusY),
+          focusKeyframes: nextKeyframes,
+        };
+      }),
     );
   };
 
   const resetClipFocus = (clipId: number) => {
     setClips((previous) =>
-      previous.map((clip) => (clip.id === clipId ? { ...clip, focusX: 0.5, focusY: 0.5 } : clip)),
+      previous.map((clip) =>
+        clip.id === clipId
+          ? { ...clip, focusX: 0.5, focusY: 0.5, focusKeyframes: [] }
+          : clip,
+      ),
     );
   };
 
@@ -1249,13 +1276,17 @@ export default function App() {
         aspect: aspectFromFormat(clip.format),
         focusX: clip.focusX,
         focusY: clip.focusY,
+        focusKeyframes: clip.focusKeyframes,
         captionStyle: clip.captionStyle,
         transcriptExcerpt: clip.transcriptExcerpt,
         manuallyTrimmed:
           Math.abs(clip.startSeconds - clip.originalStartSeconds) > 0.05 ||
           Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05,
         reframed:
-          Math.abs(clip.focusX - 0.5) > 0.02 || Math.abs(clip.focusY - 0.5) > 0.02,
+          Math.abs(clip.focusX - 0.5) > 0.02 ||
+          Math.abs(clip.focusY - 0.5) > 0.02 ||
+          clip.focusKeyframes.length > 0,
+        speakerTracking: clip.focusKeyframes.length > 1,
         previewUrl: currentVideoId ? getClipEmbedUrl(currentVideoId, clip) : null,
         youtubeUrl: currentVideoId
           ? `https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`
@@ -1297,6 +1328,7 @@ export default function App() {
         aspect: aspectFromFormat(clip.format),
         focusX: clip.focusX,
         focusY: clip.focusY,
+        focusKeyframes: clip.focusKeyframes,
         onStatus: (message) => {
           setUploadRenderStatus((prev) => ({ ...prev, [clip.id]: message }));
         },
@@ -1357,8 +1389,9 @@ export default function App() {
           startSeconds: clip.startSeconds,
           endSeconds: clip.endSeconds,
           aspect: aspectFromFormat(clip.format),
-        focusX: clip.focusX,
-        focusY: clip.focusY,
+          focusX: clip.focusX,
+          focusY: clip.focusY,
+          focusKeyframes: clip.focusKeyframes,
         }),
       });
 
@@ -1937,8 +1970,13 @@ export default function App() {
                                     Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05) && (
                                     <span className="ml-1.5 text-primary">· edited</span>
                                   )}
-                                  {(Math.abs(clip.focusX - 0.5) > 0.02 || Math.abs(clip.focusY - 0.5) > 0.02) && (
-                                    <span className="ml-1.5 text-primary">· reframed</span>
+                                  {(clip.focusKeyframes.length > 1
+                                    ? true
+                                    : Math.abs(clip.focusX - 0.5) > 0.02 ||
+                                      Math.abs(clip.focusY - 0.5) > 0.02) && (
+                                    <span className="ml-1.5 text-primary">
+                                      {clip.focusKeyframes.length > 1 ? "· tracking" : "· reframed"}
+                                    </span>
                                   )}
                                 </p>
                               </div>
