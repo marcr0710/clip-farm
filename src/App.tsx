@@ -2,10 +2,8 @@ import { useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
-  CheckCircle2,
   Clock3,
   Film,
-  Gauge,
   Link2,
   LoaderCircle,
   PlayCircle,
@@ -149,7 +147,85 @@ const FALLBACK_CLIPS: AICandidate[] = [
     endSeconds: 1072,
     score: 89,
   },
+  {
+    title: "The surprising number that stops the scroll",
+    hook: "One number made the whole argument land harder.",
+    reason: "Concrete figures create instant credibility and make the cut feel complete on its own.",
+    startSeconds: 1315,
+    endSeconds: 1362,
+    score: 87,
+  },
+  {
+    title: "The lesson viewers will replay",
+    hook: "The advice only works if you reverse the order.",
+    reason: "A clear lesson with a twist ending gives short-form audiences a reason to rewatch.",
+    startSeconds: 700,
+    endSeconds: 745,
+    score: 85,
+  },
+  {
+    title: "The tension build before the reveal",
+    hook: "Hold the answer just long enough to force a comment.",
+    reason: "Delayed payoff and unresolved tension drive watch-through and discussion.",
+    startSeconds: 300,
+    endSeconds: 340,
+    score: 84,
+  },
+  {
+    title: "The mistake everyone makes first",
+    hook: "This is the part most people skip — and it costs them views.",
+    reason: "Mistake-then-fix patterns convert well because viewers self-identify with the problem.",
+    startSeconds: 180,
+    endSeconds: 220,
+    score: 83,
+  },
+  {
+    title: "The clean close that invites a share",
+    hook: "If you only remember one thing from this, make it this.",
+    reason: "A punchy closer with a memorable line is easy to clip and easy to share.",
+    startSeconds: 1180,
+    endSeconds: 1220,
+    score: 82,
+  },
 ];
+
+const CLIP_COUNT_OPTIONS = [3, 5, 8, 12] as const;
+type ClipCount = (typeof CLIP_COUNT_OPTIONS)[number];
+
+const buildFallbackCandidates = (count: number, durationSeconds?: number): AICandidate[] => {
+  const safeCount = Math.max(1, Math.min(12, Math.floor(count) || 3));
+  const duration = durationSeconds && durationSeconds > 0 ? durationSeconds : undefined;
+
+  return Array.from({ length: safeCount }, (_, index) => {
+    const template = FALLBACK_CLIPS[index % FALLBACK_CLIPS.length];
+    const score = Math.max(70, template.score - index);
+
+    if (duration) {
+      const span = Math.min(36, Math.max(18, Math.floor(duration / Math.max(5, safeCount + 1))));
+      const startSeconds = Math.min(
+        Math.max(0, Math.floor(duration * ((index + 1) / (safeCount + 1))) - Math.floor(span / 2)),
+        Math.max(0, Math.floor(duration) - span),
+      );
+      return {
+        ...template,
+        title: index < FALLBACK_CLIPS.length ? template.title : `${template.title} (${index + 1})`,
+        startSeconds,
+        endSeconds: startSeconds + span,
+        score,
+      };
+    }
+
+    const baseStart = template.startSeconds + Math.floor(index / FALLBACK_CLIPS.length) * 90;
+    const baseEnd = template.endSeconds + Math.floor(index / FALLBACK_CLIPS.length) * 90;
+    return {
+      ...template,
+      title: index < FALLBACK_CLIPS.length ? template.title : `${template.title} (${index + 1})`,
+      startSeconds: baseStart,
+      endSeconds: Math.max(baseEnd, baseStart + 18),
+      score,
+    };
+  });
+};
 
 const isYouTubeUrl = (value: string) => /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/i.test(value.trim());
 
@@ -277,12 +353,18 @@ const getCaptionLabel = (captionPreset: string) => {
   return "Bold punch captions";
 };
 
-const buildPrompt = (meta: VideoMeta | null, windows: TranscriptWindow[], sourceLabel = "video transcript") => {
+const buildPrompt = (
+  meta: VideoMeta | null,
+  windows: TranscriptWindow[],
+  sourceLabel = "video transcript",
+  clipCount = 3,
+) => {
   const transcript = windows
     .map((window, index) => `${index + 1}. ${formatTime(window.startSeconds)}-${formatTime(window.endSeconds)} | ${window.text}`)
     .join("\n");
+  const count = Math.max(1, Math.min(12, Math.floor(clipCount) || 3));
 
-  return `You are ranking viral short-form clip candidates from a ${sourceLabel}.\n\nVideo title: ${meta?.title ?? "Unknown"}\nChannel: ${meta?.author ?? "Unknown"}\nDuration: ${meta?.durationSeconds ? formatTime(meta.durationSeconds) : "unknown"}\n\nRules:\n- Pick the 3 best standalone clips.\n- Determine natural clip lengths from the content itself; do not force a fixed duration.\n- Never cut off setup, payoff, or the final key sentence.\n- Favor strong hooks, tension, surprise, emotional payoff, concrete lessons, disagreement potential, and replay value.\n- Keep clips between 15 and 70 seconds when possible.\n- Prefer moments spread across the timeline rather than clustering near the start.\n- Return valid JSON only in this exact shape:\n{\n  "clips": [\n    {\n      "title": "...",\n      "hook": "...",\n      "reason": "...",\n      "startSeconds": 0,\n      "endSeconds": 0,\n      "score": 0\n    }\n  ]\n}\n\nTimeline windows:\n${transcript}`;
+  return `You are ranking viral short-form clip candidates from a ${sourceLabel}.\n\nVideo title: ${meta?.title ?? "Unknown"}\nChannel: ${meta?.author ?? "Unknown"}\nDuration: ${meta?.durationSeconds ? formatTime(meta.durationSeconds) : "unknown"}\n\nRules:\n- Pick exactly the ${count} best standalone clips.\n- Return exactly ${count} items in the clips array — no fewer, no more.\n- Determine natural clip lengths from the content itself; do not force a fixed duration.\n- Never cut off setup, payoff, or the final key sentence.\n- Favor strong hooks, tension, surprise, emotional payoff, concrete lessons, disagreement potential, and replay value.\n- Keep clips between 15 and 70 seconds when possible.\n- Prefer moments spread across the timeline rather than clustering near the start.\n- Rank by viral potential: highest score first.\n- Return valid JSON only in this exact shape:\n{\n  "clips": [\n    {\n      "title": "...",\n      "hook": "...",\n      "reason": "...",\n      "startSeconds": 0,\n      "endSeconds": 0,\n      "score": 0\n    }\n  ]\n}\n\nTimeline windows:\n${transcript}`;
 };
 
 // When the user only has a local file (no YouTube captions), build evenly
@@ -400,9 +482,10 @@ async function fetchYouTubeMeta(videoId: string): Promise<VideoMeta | null> {
   }
 }
 
-const parseAIClipPayload = (raw: string): AICandidate[] | null => {
+const parseAIClipPayload = (raw: string, maxClips = 12): AICandidate[] | null => {
   const cleaned = raw.trim();
   const jsonCandidate = cleaned.match(/\{[\s\S]*\}/)?.[0] ?? cleaned;
+  const limit = Math.max(1, Math.min(12, Math.floor(maxClips) || 3));
 
   try {
     const parsed = JSON.parse(jsonCandidate) as { clips?: AICandidate[] };
@@ -418,7 +501,7 @@ const parseAIClipPayload = (raw: string): AICandidate[] | null => {
         score: Number(clip.score),
       }))
       .filter((clip) => Number.isFinite(clip.startSeconds) && Number.isFinite(clip.endSeconds) && clip.endSeconds > clip.startSeconds)
-      .slice(0, 3);
+      .slice(0, limit);
   } catch {
     return null;
   }
@@ -439,6 +522,7 @@ export default function App() {
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [platform, setPlatform] = useState("shorts");
   const [captionPreset, setCaptionPreset] = useState("bold");
+  const [clipCount, setClipCount] = useState<ClipCount>(5);
   const [stageIndex, setStageIndex] = useState(-1);
   const [isProcessing, setIsProcessing] = useState(false);
   const [clips, setClips] = useState<Clip[]>([]);
@@ -704,25 +788,14 @@ export default function App() {
         const transcriptWindows = buildTimelineWindowsFromDuration(meta.durationSeconds ?? 180);
 
         setStageIndex(3);
-        const prompt = buildPrompt(meta, transcriptWindows, "uploaded local video file");
+        const prompt = buildPrompt(meta, transcriptWindows, "uploaded local video file", clipCount);
         const aiOutput = aiModel ? await complete(prompt) : "";
 
-        const parsed = parseAIClipPayload(aiOutput || "");
+        const parsed = parseAIClipPayload(aiOutput || "", clipCount);
         // Scale fallback sample timestamps into the uploaded file's duration so
         // the UI still produces usable ranges without a YouTube link.
         const duration = meta.durationSeconds ?? 180;
-        const fallbackCandidates = FALLBACK_CLIPS.map((candidate, index) => {
-          const span = Math.min(36, Math.max(18, Math.floor(duration / 5)));
-          const startSeconds = Math.min(
-            Math.max(0, Math.floor(duration * ((index + 1) / (FALLBACK_CLIPS.length + 1))) - Math.floor(span / 2)),
-            Math.max(0, Math.floor(duration) - span),
-          );
-          return {
-            ...candidate,
-            startSeconds,
-            endSeconds: startSeconds + span,
-          };
-        });
+        const fallbackCandidates = buildFallbackCandidates(clipCount, duration);
         const candidates = parsed?.length ? parsed : fallbackCandidates;
         const timingWindows = parsed?.length ? transcriptWindows : buildTimelineWindowsFromDuration(duration);
 
@@ -731,8 +804,8 @@ export default function App() {
         setClips(buildClipCards(candidates, timingWindows));
         setAiSummary(
           parsed?.length
-            ? "Claude Sonnet 5 scored the uploaded video's timeline and kept clip lengths flexible so each cut ends on a full idea. No YouTube link was needed."
-            : "AI scaffolding is active, and the UI fell back to local timeline moments from your uploaded file because a structured response was not available for this run.",
+            ? `Claude Sonnet 5 scored the uploaded video's timeline and returned ${candidates.length} clip${candidates.length === 1 ? "" : "s"} with flexible lengths so each cut ends on a full idea. No YouTube link was needed.`
+            : `AI scaffolding is active, and the UI fell back to ${candidates.length} local timeline moment${candidates.length === 1 ? "" : "s"} from your uploaded file because a structured response was not available for this run.`,
         );
         return;
       }
@@ -749,12 +822,12 @@ export default function App() {
         : SAMPLE_WINDOWS;
       setStageIndex(2);
 
-      const prompt = buildPrompt(meta, transcriptWindows, "YouTube video transcript");
+      const prompt = buildPrompt(meta, transcriptWindows, "YouTube video transcript", clipCount);
       setStageIndex(3);
       const aiOutput = aiModel ? await complete(prompt) : "";
 
-      const parsed = parseAIClipPayload(aiOutput || "");
-      const candidates = parsed?.length ? parsed : FALLBACK_CLIPS;
+      const parsed = parseAIClipPayload(aiOutput || "", clipCount);
+      const candidates = parsed?.length ? parsed : buildFallbackCandidates(clipCount);
       // Fallback candidates carry timestamps written against SAMPLE_WINDOWS;
       // only time real AI picks against the (possibly real) transcript windows.
       const timingWindows = parsed?.length ? transcriptWindows : SAMPLE_WINDOWS;
@@ -764,9 +837,9 @@ export default function App() {
       setClips(buildClipCards(candidates, timingWindows));
       setAiSummary(parsed?.length
         ? usedRealTranscript
-          ? "Claude Sonnet 5 scored this video's real transcript and kept clip lengths flexible so each cut ends on a full idea."
-          : "No captions were available for this video, so Claude Sonnet 5 scored representative sample transcript windows instead of the real timeline."
-        : "AI scaffolding is active, and the UI fell back to local sample moments because a structured response was not available for this run.");
+          ? `Claude Sonnet 5 scored this video's real transcript and returned ${candidates.length} clip${candidates.length === 1 ? "" : "s"} with flexible lengths so each cut ends on a full idea.`
+          : `No captions were available for this video, so Claude Sonnet 5 scored representative sample windows and returned ${candidates.length} clip${candidates.length === 1 ? "" : "s"}.`
+        : `AI scaffolding is active, and the UI fell back to ${candidates.length} local sample moment${candidates.length === 1 ? "" : "s"} because a structured response was not available for this run.`);
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "The local analysis run failed.");
     } finally {
@@ -822,8 +895,8 @@ export default function App() {
       <main className="relative overflow-hidden">
         <DotPattern className="pointer-events-none absolute inset-x-0 top-0 h-[540px] opacity-50 [mask-image:radial-gradient(ellipse_at_top,white,transparent_75%)]" />
 
-        <section className="mx-auto max-w-7xl px-4 pb-8 pt-10 sm:px-6 lg:px-8 lg:pt-16">
-          <div className="grid gap-8 lg:grid-cols-[1.18fr_0.82fr] lg:items-start">
+        <section className="mx-auto max-w-7xl px-4 pb-8 pt-10 sm:px-6 lg:px-8 lg:pt-14">
+          <div className="grid gap-8 lg:grid-cols-[minmax(0,1.12fr)_minmax(0,0.88fr)] lg:items-start">
             <BlurFade inView className="space-y-6">
               <Badge className="rounded-full bg-primary/10 px-3 py-1 text-primary hover:bg-primary/10">
                 AI clip finder · content-aware duration
@@ -840,8 +913,14 @@ export default function App() {
               <div className="grid gap-3 sm:grid-cols-3">
                 <MagicCard className="rounded-3xl border border-border/60 bg-card/80 p-5 shadow-sm">
                   <p className="text-sm text-muted-foreground">AI-scored moments</p>
-                  <p className="mt-3 text-3xl font-semibold tracking-tight"><NumberTicker value={3} /></p>
-                  <p className="mt-2 text-sm text-muted-foreground">Best complete clips selected from the full transcript timeline.</p>
+                  <p className="mt-3 text-3xl font-semibold tracking-tight">
+                    <NumberTicker value={clips.length > 0 ? clips.length : clipCount} />
+                  </p>
+                  <p className="mt-2 text-sm text-muted-foreground">
+                    {clips.length > 0
+                      ? "Complete clips ranked from this session’s timeline."
+                      : `Up to ${clipCount} complete clips from the full timeline.`}
+                  </p>
                 </MagicCard>
                 <MagicCard className="rounded-3xl border border-border/60 bg-card/80 p-5 shadow-sm">
                   <p className="text-sm text-muted-foreground">Clip runtime</p>
@@ -856,25 +935,25 @@ export default function App() {
               </div>
             </BlurFade>
 
-            <BlurFade inView delay={0.1} className="relative">
+            <BlurFade inView delay={0.1} className="relative lg:sticky lg:top-24">
               <Card className="relative overflow-hidden rounded-[28px] border border-primary/20 bg-card/90 shadow-2xl shadow-primary/10 backdrop-blur">
                 <BorderBeam size={280} duration={9} delay={1} />
                 <CardHeader className="space-y-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
                       <CardTitle className="text-2xl tracking-tight">Clip session</CardTitle>
-                      <CardDescription>
-                        Upload a video file or paste a YouTube link. AI identifies viral segments and lets you preview and download each cut — a link is optional once a file is uploaded.
+                      <CardDescription className="mt-1">
+                        Upload a file or paste a YouTube link. AI ranks viral moments — both inputs are optional if the other is set.
                       </CardDescription>
                     </div>
-                    <div className="rounded-2xl border border-border/70 bg-secondary px-3 py-2 text-right text-sm">
+                    <div className="shrink-0 rounded-2xl border border-border/70 bg-secondary px-3 py-2 text-right text-sm">
                       <p className="font-medium">Progress</p>
-                      <p className="text-muted-foreground">{progress}%</p>
+                      <p className="tabular-nums text-muted-foreground">{progress}%</p>
                     </div>
                   </div>
                 </CardHeader>
-                <CardContent className="space-y-5">
-                  <div className="space-y-2 rounded-2xl border border-dashed border-primary/25 bg-primary/5 p-4">
+                <CardContent className="space-y-4">
+                  <div className="space-y-3 rounded-2xl border border-dashed border-primary/25 bg-primary/5 p-4 transition-colors">
                     <div className="flex items-center justify-between gap-3">
                       <label className="text-sm font-medium">Video file</label>
                       {uploadedFile ? (
@@ -898,21 +977,31 @@ export default function App() {
                     <Button
                       type="button"
                       variant="outline"
-                      className="h-10 w-full justify-start gap-2 rounded-xl border-border/70 bg-background/80 text-left"
+                      className="h-11 w-full justify-start gap-2 overflow-hidden rounded-xl border-border/70 bg-background/80 text-left"
                       onClick={() => uploadInputRef.current?.click()}
                     >
-                      <Upload className="size-4" />
-                      {uploadedFile ? uploadedFile.name : "Upload a video to analyze"}
+                      <Upload className="size-4 shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">
+                        {uploadedFile ? uploadedFile.name : "Choose a video to analyze"}
+                      </span>
+                      {uploadedFile ? (
+                        <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+                          {formatFileSize(uploadedFile.size)}
+                        </span>
+                      ) : null}
                     </Button>
-                    <p className="text-xs leading-5 text-muted-foreground">
+                    <p className="min-h-[2.5rem] text-xs leading-5 text-muted-foreground">
                       {uploadedFile
-                        ? `${formatFileSize(uploadedFile.size)} ready on this device. Clips are trimmed in your browser — large files are fine, nothing is uploaded to a server.`
-                        : "Upload a file you own the rights to. Trimming runs in your browser, so large videos (100 MB+) work without a server size limit."}
+                        ? "Ready on this device. Trimming runs in your browser — nothing is uploaded to a server."
+                        : "Own the rights to the file. Large videos are fine; clips are cut locally in the browser."}
                     </p>
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">YouTube link <span className="font-normal text-muted-foreground">(optional if a file is uploaded)</span></label>
+                    <label className="text-sm font-medium">
+                      YouTube link{" "}
+                      <span className="font-normal text-muted-foreground">(optional with a file)</span>
+                    </label>
                     <Input
                       value={youtubeUrl}
                       onChange={(event) => {
@@ -920,18 +1009,36 @@ export default function App() {
                         setError("");
                       }}
                       placeholder="https://www.youtube.com/watch?v=..."
-                      className="h-12 rounded-2xl border-border/70 bg-background/80"
+                      className="h-11 rounded-2xl border-border/70 bg-background/80"
                     />
-                    <p className="text-xs leading-5 text-muted-foreground">
+                    <p className="min-h-[2.5rem] text-xs leading-5 text-muted-foreground">
                       {uploadedFile
-                        ? "Optional. Leave blank to analyze and render from the uploaded file only. Add a link if you also want captions and YouTube embeds."
-                        : "Optional if you upload a video below. Use only videos you own or are authorized to repurpose."}
+                        ? "Optional. Leave blank for upload-only analysis, or add a link for captions and embeds."
+                        : "Optional if you upload a file. Use only videos you own or are authorized to repurpose."}
                     </p>
                   </div>
 
-                  <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="grid gap-3 sm:grid-cols-3">
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">Output preset</label>
+                      <label className="text-sm font-medium">Moments</label>
+                      <Select
+                        value={String(clipCount)}
+                        onValueChange={(value) => setClipCount(Number(value) as ClipCount)}
+                      >
+                        <SelectTrigger className="h-11 w-full rounded-2xl border-border/70 bg-background/80">
+                          <SelectValue placeholder="How many" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {CLIP_COUNT_OPTIONS.map((count) => (
+                            <SelectItem key={count} value={String(count)}>
+                              {count} clips
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Output</label>
                       <Select value={platform} onValueChange={setPlatform}>
                         <SelectTrigger className="h-11 w-full rounded-2xl border-border/70 bg-background/80">
                           <SelectValue placeholder="Select platform" />
@@ -951,18 +1058,18 @@ export default function App() {
                           <SelectValue placeholder="Select captions" />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="bold">Bold punch captions</SelectItem>
-                          <SelectItem value="bar">Creator subtitle bar</SelectItem>
-                          <SelectItem value="clean">Clean lower thirds</SelectItem>
+                          <SelectItem value="bold">Bold punch</SelectItem>
+                          <SelectItem value="bar">Subtitle bar</SelectItem>
+                          <SelectItem value="clean">Lower thirds</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
                   </div>
 
-                  <div className="rounded-3xl border border-primary/15 bg-primary/6 p-4 text-sm">
-                    <p className="font-medium text-foreground">Auto-fit clip length is enabled</p>
-                    <p className="mt-1 leading-6 text-muted-foreground">
-                      The app now chooses clip duration from the moment itself. Instead of forcing 20/30/45-second cuts, it expands just enough to preserve the hook, the context needed for meaning, and the final payoff.
+                  <div className="rounded-2xl border border-primary/15 bg-primary/6 px-4 py-3 text-sm">
+                    <p className="font-medium text-foreground">Auto-fit length · {clipCount} moments</p>
+                    <p className="mt-1 leading-5 text-muted-foreground">
+                      AI ranks the top {clipCount} complete moments and sizes each cut to the payoff — not a fixed timer.
                     </p>
                   </div>
 
@@ -989,6 +1096,7 @@ export default function App() {
                         setStageIndex(-1);
                         setVideoMeta(null);
                         setYoutubeUrl("");
+                        setClipCount(5);
                         clearUploadedFile();
                         setAiSummary("AI will analyze a YouTube link or an uploaded video timeline to find the moments most likely to hold attention, trigger comments, and deliver a clean payoff.");
                       }}
@@ -1019,42 +1127,40 @@ export default function App() {
                     <div className="mb-3 flex items-center justify-between gap-4">
                       <p className="text-sm font-medium">Session state</p>
                       <Badge variant={isProcessing ? "default" : clips.length ? "secondary" : "outline"} className="rounded-full px-3 py-1">
-                        {isProcessing ? "Analyzing" : clips.length ? "Clips ready" : "Waiting for run"}
+                        {isProcessing ? "Analyzing" : clips.length ? `${clips.length} ready` : "Waiting for run"}
                       </Badge>
                     </div>
-                    <div className="space-y-3">
+                    <div className="min-h-[8.5rem] space-y-3">
                       {isProcessing ? (
-                        activeStages.map((stage, index) => {
-                          const complete = index < stageIndex;
-                          const current = index === stageIndex;
-                          return (
-                            <div key={stage} className="flex items-start gap-3 rounded-2xl border border-border/60 bg-card/80 p-3">
-                              {complete ? (
-                                <CheckCircle2 className="mt-0.5 size-4 text-primary" />
-                              ) : current ? (
-                                <Clock3 className="mt-0.5 size-4 animate-pulse text-primary" />
-                              ) : (
-                                <Gauge className="mt-0.5 size-4 text-muted-foreground" />
-                              )}
-                              <div>
-                                <p className="text-sm font-medium">{stage}</p>
-                                <p className="text-xs text-muted-foreground">
-                                  {current ? "Currently processing this stage." : complete ? "Completed." : "Queued next."}
-                                </p>
-                              </div>
+                        <div className="rounded-2xl border border-border/60 bg-card/80 p-4">
+                          <div className="mb-3 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+                            <span>Step {Math.min(stageIndex + 1, activeStages.length)} of {activeStages.length}</span>
+                            <span className="tabular-nums">{progress}%</span>
+                          </div>
+                          <div className="mb-3 h-1.5 overflow-hidden rounded-full bg-muted">
+                            <div
+                              className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out"
+                              style={{ width: `${progress}%` }}
+                            />
+                          </div>
+                          <div className="flex items-start gap-3">
+                            <Clock3 className="mt-0.5 size-4 shrink-0 animate-pulse text-primary" />
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium">{activeStages[Math.min(stageIndex, activeStages.length - 1)]}</p>
+                              <p className="mt-1 text-xs text-muted-foreground">Scoring moments and preparing clip ranges…</p>
                             </div>
-                          );
-                        })
+                          </div>
+                        </div>
                       ) : clips.length ? (
                         <div className="rounded-2xl border border-primary/20 bg-primary/8 p-4">
-                          <p className="text-sm font-medium">AI analysis complete</p>
-                          <p className="mt-1 text-sm text-muted-foreground">{aiSummary}</p>
+                          <p className="text-sm font-medium">AI analysis complete · {clips.length} moments</p>
+                          <p className="mt-1 text-sm leading-6 text-muted-foreground">{aiSummary}</p>
                         </div>
                       ) : (
                         <div className="rounded-2xl border border-dashed border-border/70 bg-card/60 p-4">
                           <p className="text-sm font-medium">No analysis running yet</p>
                           <p className="mt-1 text-sm text-muted-foreground">
-                            Start a session to see transcript scoring, AI ranking, and preview-ready clip candidates.
+                            Pick a source and moment count, then run AI analysis for ranked clip candidates.
                           </p>
                         </div>
                       )}
@@ -1067,16 +1173,16 @@ export default function App() {
         </section>
 
         <section className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-          <div className="grid gap-6 lg:grid-cols-[0.82fr_1.18fr]">
-            <BlurFade inView delay={0.15}>
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] lg:items-start">
+            <BlurFade inView delay={0.15} className="lg:sticky lg:top-24">
               <Card className="rounded-[28px] border-border/70 bg-card/85 shadow-sm">
                 <CardHeader>
-                  <CardTitle className="text-2xl tracking-tight">How the upgraded local flow works</CardTitle>
+                  <CardTitle className="text-2xl tracking-tight">How the local flow works</CardTitle>
                   <CardDescription>
-                    The product direction now supports AI ranking, content-aware clip sizing, and working preview embeds without introducing a database.
+                    AI ranking, content-aware clip sizing, and working previews — all without a database.
                   </CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-4">
+                <CardContent className="space-y-3">
                   {pipeline.map((item) => {
                     const Icon = item.icon;
                     return (
@@ -1095,10 +1201,10 @@ export default function App() {
                   <div className="rounded-2xl border border-border/60 bg-background/70 p-4">
                     <div className="flex items-center gap-3">
                       <Sparkles className="size-5 text-primary" />
-                      <p className="text-sm font-semibold">AI scoring is implemented</p>
+                      <p className="text-sm font-semibold">AI scoring is live</p>
                     </div>
                     <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                      The app now talks to a server-side AI proxy and asks the model to return structured clip candidates based on transcript windows. For production, the only missing piece is feeding it a real transcript instead of sample windows.
+                      Choose how many moments to return (3–12). The model ranks complete hooks from the timeline and sizes each cut to the payoff.
                     </p>
                   </div>
                 </CardContent>
@@ -1110,36 +1216,40 @@ export default function App() {
                 <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
                   <div>
                     <CardTitle className="text-2xl tracking-tight">Clip candidates</CardTitle>
-                    <CardDescription>Preview the moments the system would cut after AI transcript scoring.</CardDescription>
+                    <CardDescription>
+                      {clips.length > 0
+                        ? `${clips.length} ranked moment${clips.length === 1 ? "" : "s"} ready to preview and download.`
+                        : `Up to ${clipCount} moments after AI transcript scoring.`}
+                    </CardDescription>
                   </div>
                   <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
-                    Previewable embedded renders
+                    {clips.length > 0 ? `${clips.length} clips` : `${clipCount} requested`}
                   </Badge>
                 </CardHeader>
                 <CardContent>
                   {isProcessing ? (
-                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                      {Array.from({ length: 3 }).map((_, index) => (
+                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                      {Array.from({ length: Math.min(clipCount, 6) }).map((_, index) => (
                         <div key={index} className="overflow-hidden rounded-[24px] border border-border/60 bg-background/70 p-4">
-                          <div className="aspect-[9/16] rounded-[18px] bg-muted/80" />
+                          <div className="aspect-[9/16] animate-pulse rounded-[18px] bg-muted/80" />
                           <div className="mt-4 space-y-3">
-                            <div className="h-4 w-3/4 rounded-full bg-muted" />
-                            <div className="h-4 w-1/2 rounded-full bg-muted" />
-                            <div className="h-20 rounded-2xl bg-muted/80" />
+                            <div className="h-4 w-3/4 animate-pulse rounded-full bg-muted" />
+                            <div className="h-4 w-1/2 animate-pulse rounded-full bg-muted" />
+                            <div className="h-20 animate-pulse rounded-2xl bg-muted/80" />
                           </div>
                         </div>
                       ))}
                     </div>
                   ) : clips.length === 0 ? (
-                    <div className="flex min-h-[340px] flex-col items-center justify-center rounded-[28px] border border-dashed border-border/70 bg-background/60 px-6 text-center">
+                    <div className="flex min-h-[280px] flex-col items-center justify-center rounded-[28px] border border-dashed border-border/70 bg-background/60 px-6 text-center">
                       <Film className="mb-4 size-10 text-muted-foreground" />
                       <h3 className="text-xl font-semibold tracking-tight">No clips generated yet</h3>
                       <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-                        Upload a video or paste a YouTube link, then run AI analysis. Ranked moments will appear here with local or embedded previews.
+                        Upload a video or paste a YouTube link, pick how many moments you want, then run AI analysis.
                       </p>
                     </div>
                   ) : (
-                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
                       {clips.map((clip) => (
                         <MagicCard key={clip.id} className="rounded-[24px] border border-border/70 bg-background/80 p-4 shadow-sm">
                           <div className="relative overflow-hidden rounded-[20px] border border-primary/15 bg-[linear-gradient(180deg,rgba(66,112,240,0.18),rgba(66,112,240,0.04))]">
