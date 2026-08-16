@@ -5,6 +5,7 @@ import ffmpegPath from "ffmpeg-static";
 import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
+import { aspectVideoFilter, type RenderAspect } from "../_lib/clip-renderer.js";
 
 if (ffmpegPath) {
   ffmpeg.setFfmpegPath(ffmpegPath as unknown as string);
@@ -17,6 +18,15 @@ export const config = { maxDuration: 60 };
 // Hard safety cap so a bad start/end pair (or a runaway clip) can never turn
 // into a multi-minute download + encode inside a serverless function.
 const MAX_CLIP_SECONDS = 120;
+
+const ASPECTS = new Set<RenderAspect>(["9:16", "1:1", "16:9"]);
+
+function resolveAspect(value: unknown): RenderAspect {
+  if (typeof value === "string" && ASPECTS.has(value as RenderAspect)) {
+    return value as RenderAspect;
+  }
+  return "9:16";
+}
 
 function slugify(value: string): string {
   return (
@@ -35,7 +45,8 @@ function extensionForMime(mime: string): string {
 }
 
 /**
- * Trims [start, end) out of a user-uploaded source video with ffmpeg. Unlike
+ * Trims [start, end) out of a user-uploaded source video with ffmpeg and
+ * center-crops to the requested short-form aspect (default 9:16). Unlike
  * the YouTube-fetch render path, this never talks to YouTube's servers, so
  * it keeps working even when YouTube's bot-check blocks datacenter IPs.
  *
@@ -52,18 +63,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const workDir = await mkdtemp(path.join(tmpdir(), "clipcraft-upload-"));
 
   try {
-    const { fileBase64, mimeType, startSeconds, endSeconds, title } = req.body ?? {};
+    const { fileBase64, mimeType, startSeconds, endSeconds, title, aspect } = req.body ?? {};
 
     if (typeof fileBase64 !== "string" || !fileBase64.trim()) {
       return res.status(400).json({ error: "No video file data was received." });
     }
 
-    const start = Math.max(0, Math.floor(Number(startSeconds)));
-    const requestedEnd = Math.max(start + 1, Math.ceil(Number(endSeconds)));
-    if (!Number.isFinite(start) || !Number.isFinite(requestedEnd)) {
+    const start = Math.max(0, Number(startSeconds) || 0);
+    const requestedEnd = Math.max(start + 0.25, Number(endSeconds) || start + 1);
+    if (!Number.isFinite(start) || !Number.isFinite(requestedEnd) || requestedEnd <= start) {
       return res.status(400).json({ error: "Valid startSeconds and endSeconds are required." });
     }
     const duration = Math.min(requestedEnd - start, MAX_CLIP_SECONDS);
+    const resolvedAspect = resolveAspect(aspect);
+    const vf = aspectVideoFilter(resolvedAspect);
 
     let sourceBuffer: Buffer;
     try {
@@ -84,9 +97,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ffmpeg(sourcePath)
         .setStartTime(start)
         .setDuration(duration)
-        .outputOptions(["-movflags", "+faststart", "-preset", "veryfast"])
+        .videoFilters(vf)
+        .outputOptions([
+          "-movflags",
+          "+faststart",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "23",
+          "-pix_fmt",
+          "yuv420p",
+        ])
         .videoCodec("libx264")
         .audioCodec("aac")
+        .audioBitrate("128k")
         .output(outputPath)
         .on("end", () => resolve())
         .on("error", (err: Error) => reject(new Error(`ffmpeg could not trim that file: ${err.message}`)))
@@ -95,10 +119,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const buffer = await readFile(outputPath);
     const safeTitle = slugify(typeof title === "string" ? title : "clip");
+    const startLabel = Math.floor(start);
+    const endLabel = Math.floor(start + duration);
 
     res.writeHead(200, {
       "Content-Type": "video/mp4",
-      "Content-Disposition": `attachment; filename="${safeTitle}-${start}s-${start + duration}s.mp4"`,
+      "Content-Disposition": `attachment; filename="${safeTitle}-${startLabel}s-${endLabel}s-${resolvedAspect.replace(":", "x")}.mp4"`,
       "Content-Length": buffer.length,
     });
     res.end(buffer);

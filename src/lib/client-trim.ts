@@ -50,28 +50,47 @@ async function getFFmpeg(onProgress?: (ratio: number) => void): Promise<FFmpeg> 
   return ffmpeg;
 }
 
+export type ShortsAspect = "9:16" | "1:1" | "16:9";
+
 export type ClientTrimOptions = {
   file: File;
   startSeconds: number;
   endSeconds: number;
+  /** Output framing. Defaults to YouTube Shorts 9:16. */
+  aspect?: ShortsAspect;
   onStatus?: (message: string) => void;
   onProgress?: (ratio: number) => void;
 };
 
+/** Center-crop + scale filter for Shorts / Reels / square / landscape. */
+export function aspectFilter(aspect: ShortsAspect = "9:16"): string {
+  if (aspect === "1:1") {
+    return "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,setsar=1";
+  }
+  if (aspect === "16:9") {
+    return "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1";
+  }
+  // YouTube Shorts / Reels default
+  return "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1";
+}
+
 /**
- * Trim a clip from a local video file entirely in the browser.
- * The full file never leaves the device — no server upload, no 60 MB body cap.
+ * Trim a clip from a local video file entirely in the browser and re-frame it
+ * to the target short-form aspect (default 9:16). The full file never leaves
+ * the device — no server upload, no 60 MB body cap.
  */
 export async function trimVideoInBrowser({
   file,
   startSeconds,
   endSeconds,
+  aspect = "9:16",
   onStatus,
   onProgress,
 }: ClientTrimOptions): Promise<Blob> {
-  const start = Math.max(0, Math.floor(Number(startSeconds) || 0));
-  const requestedEnd = Math.max(start + 1, Math.ceil(Number(endSeconds) || start + 1));
+  const start = Math.max(0, Number(startSeconds) || 0);
+  const requestedEnd = Math.max(start + 0.25, Number(endSeconds) || start + 1);
   const duration = Math.min(requestedEnd - start, MAX_CLIP_SECONDS);
+  const vf = aspectFilter(aspect);
 
   onStatus?.("Loading the local video engine (first run downloads ~25 MB)…");
   const ffmpeg = await getFFmpeg(onProgress);
@@ -84,68 +103,40 @@ export async function trimVideoInBrowser({
     onStatus?.("Reading your video into local memory…");
     await ffmpeg.writeFile(inputName, await fetchFile(file));
 
-    // Fast path: stream-copy the segment (no re-encode). This is much faster
-    // on large files and keeps quality identical to the source. Cuts land on
-    // the nearest prior keyframe, which is fine for short social clips.
-    onStatus?.(`Trimming ${duration}s locally…`);
-    let exitCode = await ffmpeg.exec([
+    // Always re-encode so we can crop/scale to Shorts 9:16 (or the chosen
+    // aspect). Stream-copy can't apply a video filter.
+    onStatus?.(`Trimming ${duration.toFixed(1)}s and framing to ${aspect}…`);
+    const exitCode = await ffmpeg.exec([
       "-ss",
-      String(start),
+      start.toFixed(3),
       "-i",
       inputName,
       "-t",
-      String(duration),
-      "-c",
-      "copy",
+      duration.toFixed(3),
+      "-vf",
+      vf,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "23",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
       "-movflags",
       "+faststart",
-      "-avoid_negative_ts",
-      "make_zero",
+      "-pix_fmt",
+      "yuv420p",
       outputName,
     ]);
 
-    // If stream-copy produced nothing useful (odd containers / codecs), fall
-    // back to a short re-encode so the user still gets a playable MP4.
-    let data = await ffmpeg.readFile(outputName);
-    const copyLooksEmpty =
-      exitCode !== 0 ||
-      (typeof data !== "string" && data.length < 1024);
-
-    if (copyLooksEmpty) {
-      try {
-        await ffmpeg.deleteFile(outputName);
-      } catch {
-        // file may not exist
-      }
-
-      onStatus?.("Re-encoding the clip for compatibility…");
-      exitCode = await ffmpeg.exec([
-        "-ss",
-        String(start),
-        "-i",
-        inputName,
-        "-t",
-        String(duration),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        outputName,
-      ]);
-
-      if (exitCode !== 0) {
-        throw new Error("Local trim failed. Try a different video format (MP4 works best).");
-      }
-      data = await ffmpeg.readFile(outputName);
+    if (exitCode !== 0) {
+      throw new Error("Local trim failed. Try a different video format (MP4 works best).");
     }
+
+    const data = await ffmpeg.readFile(outputName);
 
     if (typeof data === "string") {
       throw new Error("Unexpected text output from the local video engine.");

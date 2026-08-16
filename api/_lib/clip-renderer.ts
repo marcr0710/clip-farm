@@ -15,15 +15,30 @@ if (ffmpegPath) {
 // into a multi-minute download + encode inside a serverless function.
 const MAX_CLIP_SECONDS = 120;
 
+export type RenderAspect = "9:16" | "1:1" | "16:9";
+
 export interface RenderClipParams {
   url: string;
   startSeconds: number;
   endSeconds: number;
+  /** Output framing. Defaults to YouTube Shorts 9:16. */
+  aspect?: RenderAspect;
 }
 
 export interface RenderClipResult {
   buffer: Buffer;
   filename: string;
+}
+
+/** Center-crop + scale filter for Shorts / Reels / square / landscape. */
+export function aspectVideoFilter(aspect: RenderAspect = "9:16"): string {
+  if (aspect === "1:1") {
+    return "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080,setsar=1";
+  }
+  if (aspect === "16:9") {
+    return "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1";
+  }
+  return "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1";
 }
 
 function getVideoId(url: string): string | null {
@@ -62,10 +77,14 @@ function slugify(value: string): string {
 /**
  * Downloads the source YouTube video (progressive mp4, audio+video in one
  * stream) and cuts the requested [start, end) range with ffmpeg, re-encoding
- * so the trim points land exactly where requested. Returns the finished clip
- * as an in-memory buffer, ready to stream back as a file download.
+ * and center-cropping to the target short-form aspect (default 9:16).
  */
-export async function renderClip({ url, startSeconds, endSeconds }: RenderClipParams): Promise<RenderClipResult> {
+export async function renderClip({
+  url,
+  startSeconds,
+  endSeconds,
+  aspect = "9:16",
+}: RenderClipParams): Promise<RenderClipResult> {
   const videoId = getVideoId(url);
   if (!videoId) {
     throw new Error("Could not resolve a YouTube video ID from that URL.");
@@ -74,9 +93,10 @@ export async function renderClip({ url, startSeconds, endSeconds }: RenderClipPa
     throw new Error("That does not look like a valid YouTube video ID.");
   }
 
-  const start = Math.max(0, Math.floor(startSeconds));
-  const requestedEnd = Math.max(start + 1, Math.ceil(endSeconds));
+  const start = Math.max(0, Number(startSeconds) || 0);
+  const requestedEnd = Math.max(start + 0.25, Number(endSeconds) || start + 1);
   const duration = Math.min(requestedEnd - start, MAX_CLIP_SECONDS);
+  const vf = aspectVideoFilter(aspect);
 
   const BOT_CHECK_MESSAGE =
     "YouTube is blocking video downloads from this server (it shows YouTube's own \"Sign in to confirm you're not a bot\" check). This is a network-level block YouTube applies to datacenter/cloud IP ranges — it isn't something this app's code can fix. Use the clip brief export instead, or try again later.";
@@ -133,9 +153,20 @@ export async function renderClip({ url, startSeconds, endSeconds }: RenderClipPa
       ffmpeg(sourcePath)
         .setStartTime(start)
         .setDuration(duration)
-        .outputOptions(["-movflags", "+faststart", "-preset", "veryfast"])
+        .videoFilters(vf)
+        .outputOptions([
+          "-movflags",
+          "+faststart",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "23",
+          "-pix_fmt",
+          "yuv420p",
+        ])
         .videoCodec("libx264")
         .audioCodec("aac")
+        .audioBitrate("128k")
         .output(outputPath)
         .on("end", () => resolve())
         .on("error", (err: Error) => reject(err))
@@ -144,7 +175,12 @@ export async function renderClip({ url, startSeconds, endSeconds }: RenderClipPa
 
     const buffer = await readFile(outputPath);
     const safeTitle = slugify(info.videoDetails?.title ?? "clip");
-    return { buffer, filename: `${safeTitle}-${start}s-${start + duration}s.mp4` };
+    const startLabel = Math.floor(start);
+    const endLabel = Math.floor(start + duration);
+    return {
+      buffer,
+      filename: `${safeTitle}-${startLabel}s-${endLabel}s-${aspect.replace(":", "x")}.mp4`,
+    };
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }

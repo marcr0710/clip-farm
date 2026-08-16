@@ -1,7 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
-  ArrowRight,
   Clock3,
   Film,
   Link2,
@@ -15,21 +14,15 @@ import {
   X,
 } from "lucide-react";
 
+import { ClipPreviewDialog } from "@/components/clip-preview-dialog";
 import { ThemeToggle } from "@/components/theme-toggle";
+import type { ShortsAspect } from "@/lib/client-trim";
 import { downloadBlob } from "@/lib/download";
 import { Badge } from "@/components/ui/badge";
 import { BlurFade } from "@/components/ui/blur-fade";
 import { BorderBeam } from "@/components/ui/border-beam";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { DotPattern } from "@/components/ui/dot-pattern";
 import { Input } from "@/components/ui/input";
 import { MagicCard } from "@/components/ui/magic-card";
@@ -41,11 +34,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import { ShimmerButton } from "@/components/ui/shimmer-button";
 import { useCompletion } from "@/lib/devs-ai/use-completion";
 
 interface TranscriptWindow {
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+}
+
+interface TranscriptCue {
   startSeconds: number;
   endSeconds: number;
   text: string;
@@ -59,6 +57,10 @@ interface Clip {
   startSeconds: number;
   endSeconds: number;
   durationSeconds: number;
+  /** AI-proposed start, kept so the user can reset a manual trim. */
+  originalStartSeconds: number;
+  /** AI-proposed end, kept so the user can reset a manual trim. */
+  originalEndSeconds: number;
   score: number;
   format: string;
   captionStyle: string;
@@ -82,6 +84,19 @@ interface AICandidate {
   endSeconds: number;
   score: number;
 }
+
+interface TranscriptBundle {
+  windows: TranscriptWindow[];
+  cues: TranscriptCue[];
+}
+
+const MIN_CLIP_SECONDS = 18;
+const MAX_CLIP_SECONDS = 58;
+const IDEAL_MIN_CLIP_SECONDS = 22;
+const IDEAL_MAX_CLIP_SECONDS = 45;
+const SENTENCE_END_RE = /[.!?]["')\]]*$/;
+const WEAK_OPENER_RE = /^(and|but|so|because|which|that|then|also|or|if|when|while|although|though|plus)\b/i;
+const WEAK_CLOSER_RE = /\b(and|but|so|because|which|that|or|if|when|while)\s*$/i;
 
 const YOUTUBE_STAGES = [
   "Validating the YouTube link",
@@ -230,9 +245,10 @@ const buildFallbackCandidates = (count: number, durationSeconds?: number): AICan
 const isYouTubeUrl = (value: string) => /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/i.test(value.trim());
 
 const formatTime = (totalSeconds: number) => {
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = Math.floor(totalSeconds % 60);
+  const safe = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = Math.floor(safe % 60);
 
   if (hours > 0) {
     return [hours, minutes, seconds].map((value) => value.toString().padStart(2, "0")).join(":");
@@ -241,7 +257,114 @@ const formatTime = (totalSeconds: number) => {
   return [minutes, seconds].map((value) => value.toString().padStart(2, "0")).join(":");
 };
 
+/** Precise timestamp for trim inputs (mm:ss or h:mm:ss, with optional decimals). */
+const formatTimePrecise = (totalSeconds: number, fractionDigits = 1) => {
+  const safe = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = safe % 60;
+  const secStr = seconds.toFixed(fractionDigits).padStart(fractionDigits > 0 ? 3 + fractionDigits : 2, "0");
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${secStr}`;
+  }
+  return `${minutes}:${secStr.padStart(fractionDigits > 0 ? 3 + fractionDigits : 2, "0")}`;
+};
+
+/** Parse "m:ss", "mm:ss.s", "h:mm:ss", or a plain seconds number into seconds. */
+const parseTimestamp = (value: string): number | null => {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const asNumber = Number(trimmed);
+    return Number.isFinite(asNumber) ? asNumber : null;
+  }
+
+  const parts = trimmed.split(":");
+  if (parts.length < 2 || parts.length > 3) return null;
+
+  const nums = parts.map((part) => Number(part));
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+
+  if (nums.length === 2) {
+    const [minutes, seconds] = nums;
+    if (seconds >= 60) return null;
+    return minutes * 60 + seconds;
+  }
+
+  const [hours, minutes, seconds] = nums;
+  if (minutes >= 60 || seconds >= 60) return null;
+  return hours * 3600 + minutes * 60 + seconds;
+};
+
+const MIN_MANUAL_CLIP_SECONDS = 1;
+const MAX_MANUAL_CLIP_SECONDS = 120;
+
+const clampClipRange = (
+  startSeconds: number,
+  endSeconds: number,
+  mediaDuration?: number,
+): { startSeconds: number; endSeconds: number; durationSeconds: number } => {
+  const maxBound =
+    mediaDuration && Number.isFinite(mediaDuration) && mediaDuration > 0
+      ? mediaDuration
+      : Number.POSITIVE_INFINITY;
+
+  let start = Math.max(0, Number(startSeconds) || 0);
+  let end = Math.max(0, Number(endSeconds) || 0);
+
+  if (end <= start) {
+    end = Math.min(maxBound, start + MIN_MANUAL_CLIP_SECONDS);
+    if (end <= start) {
+      start = Math.max(0, end - MIN_MANUAL_CLIP_SECONDS);
+    }
+  }
+
+  if (end - start > MAX_MANUAL_CLIP_SECONDS) {
+    end = start + MAX_MANUAL_CLIP_SECONDS;
+  }
+
+  if (end > maxBound) {
+    end = maxBound;
+    if (end - start < MIN_MANUAL_CLIP_SECONDS) {
+      start = Math.max(0, end - MIN_MANUAL_CLIP_SECONDS);
+    }
+  }
+
+  if (start > maxBound - MIN_MANUAL_CLIP_SECONDS) {
+    start = Math.max(0, maxBound - MIN_MANUAL_CLIP_SECONDS);
+  }
+
+  start = Number(start.toFixed(2));
+  end = Number(Math.max(start + MIN_MANUAL_CLIP_SECONDS, end).toFixed(2));
+  if (end > maxBound && Number.isFinite(maxBound)) {
+    end = Number(maxBound.toFixed(2));
+    start = Number(Math.max(0, end - MIN_MANUAL_CLIP_SECONDS).toFixed(2));
+  }
+
+  return {
+    startSeconds: start,
+    endSeconds: end,
+    durationSeconds: Number((end - start).toFixed(2)),
+  };
+};
+
+const aspectFromFormat = (format: string): ShortsAspect => {
+  if (format === "16:9" || format === "1:1" || format === "9:16") return format;
+  return "9:16";
+};
+
+const endsCompleteThought = (text: string) => {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return SENTENCE_END_RE.test(trimmed);
+};
+
+const normalizeSpeech = (text: string) => text.replace(/\s+/g, " ").trim();
+
 const findBestWindowIndex = (windows: TranscriptWindow[], seconds: number) => {
+  if (windows.length === 0) return 0;
   const directMatch = windows.findIndex((window) => seconds >= window.startSeconds && seconds <= window.endSeconds);
   if (directMatch >= 0) return directMatch;
 
@@ -252,13 +375,186 @@ const findBestWindowIndex = (windows: TranscriptWindow[], seconds: number) => {
   }, 0);
 };
 
-const deriveClipTiming = (candidate: AICandidate, windows: TranscriptWindow[]) => {
+const findNearestCueIndex = (cues: TranscriptCue[], seconds: number, prefer: "start" | "end") => {
+  if (cues.length === 0) return -1;
+
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let index = 0; index < cues.length; index += 1) {
+    const cue = cues[index];
+    const anchor = prefer === "start" ? cue.startSeconds : cue.endSeconds;
+    const distance = Math.abs(anchor - seconds);
+    // Slightly prefer cues that already contain the timestamp.
+    const containmentBonus = seconds >= cue.startSeconds && seconds <= cue.endSeconds ? 0.35 : 0;
+    const adjusted = distance - containmentBonus;
+    if (adjusted < bestDistance) {
+      bestDistance = adjusted;
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
+};
+
+const excerptFromCues = (cues: TranscriptCue[], startIndex: number, endIndex: number) =>
+  normalizeSpeech(
+    cues
+      .slice(Math.max(0, startIndex), Math.min(cues.length - 1, endIndex) + 1)
+      .map((cue) => cue.text)
+      .join(" "),
+  );
+
+const scoreBoundaryPair = (
+  cues: TranscriptCue[],
+  startIndex: number,
+  endIndex: number,
+  targetStart: number,
+  targetEnd: number,
+) => {
+  if (startIndex < 0 || endIndex < startIndex || endIndex >= cues.length) return Number.NEGATIVE_INFINITY;
+
+  const start = cues[startIndex].startSeconds;
+  const end = cues[endIndex].endSeconds;
+  const duration = end - start;
+  if (duration < MIN_CLIP_SECONDS - 0.5 || duration > MAX_CLIP_SECONDS + 1) return Number.NEGATIVE_INFINITY;
+
+  const startText = normalizeSpeech(cues[startIndex].text);
+  const endText = normalizeSpeech(cues[endIndex].text);
+  const excerpt = excerptFromCues(cues, startIndex, endIndex);
+  if (!excerpt) return Number.NEGATIVE_INFINITY;
+
+  let score = 100;
+
+  // Prefer staying close to the AI's chosen moment.
+  score -= Math.abs(start - targetStart) * 1.35;
+  score -= Math.abs(end - targetEnd) * 1.55;
+
+  // Duration sweet spot for short-form.
+  if (duration >= IDEAL_MIN_CLIP_SECONDS && duration <= IDEAL_MAX_CLIP_SECONDS) score += 18;
+  else if (duration < IDEAL_MIN_CLIP_SECONDS) score -= (IDEAL_MIN_CLIP_SECONDS - duration) * 1.8;
+  else score -= (duration - IDEAL_MAX_CLIP_SECONDS) * 1.4;
+
+  // Clean linguistic edges beat raw timestamp proximity.
+  if (endsCompleteThought(endText) || endsCompleteThought(excerpt)) score += 28;
+  else if (WEAK_CLOSER_RE.test(endText)) score -= 24;
+  else score -= 14;
+
+  if (!WEAK_OPENER_RE.test(startText)) score += 12;
+  else score -= 18;
+
+  // Tiny breath of silence before/after usually means a natural edit point.
+  const prev = cues[startIndex - 1];
+  const next = cues[endIndex + 1];
+  if (prev && cues[startIndex].startSeconds - prev.endSeconds >= 0.35) score += 6;
+  if (next && next.startSeconds - cues[endIndex].endSeconds >= 0.35) score += 8;
+
+  // Avoid ultra-short dangling final words.
+  if (endText.split(/\s+/).length <= 2 && !endsCompleteThought(endText)) score -= 10;
+
+  return score;
+};
+
+/**
+ * Snap an AI-proposed range onto nearby caption cues so cuts open on a fresh
+ * thought and close after a finished sentence — never mid-clause.
+ */
+const snapRangeToSpeechBoundaries = (
+  cues: TranscriptCue[],
+  startSeconds: number,
+  endSeconds: number,
+) => {
+  if (cues.length === 0) {
+    const start = Math.max(0, startSeconds);
+    const end = Math.max(start + MIN_CLIP_SECONDS, endSeconds);
+    return { startSeconds: start, endSeconds: end, startIndex: -1, endIndex: -1 };
+  }
+
+  const seedStart = findNearestCueIndex(cues, startSeconds, "start");
+  const seedEnd = findNearestCueIndex(cues, endSeconds, "end");
+  const targetStart = Math.max(0, startSeconds);
+  const targetEnd = Math.max(targetStart + MIN_CLIP_SECONDS, endSeconds);
+
+  let best = {
+    startIndex: Math.min(seedStart, seedEnd),
+    endIndex: Math.max(seedStart, seedEnd),
+    score: Number.NEGATIVE_INFINITY,
+  };
+
+  const startFrom = Math.max(0, seedStart - 10);
+  const startTo = Math.min(cues.length - 1, seedStart + 8);
+
+  for (let startIndex = startFrom; startIndex <= startTo; startIndex += 1) {
+    // Walk outward from the seed end so nearby sentence endings win first.
+    for (let radius = 0; radius <= 18; radius += 1) {
+      const candidates = radius === 0
+        ? [seedEnd]
+        : [seedEnd - radius, seedEnd + radius];
+
+      for (const rawEnd of candidates) {
+        const endIndex = Math.max(startIndex, Math.min(cues.length - 1, rawEnd));
+        const score = scoreBoundaryPair(cues, startIndex, endIndex, targetStart, targetEnd);
+        if (score > best.score) {
+          best = { startIndex, endIndex, score };
+        }
+      }
+    }
+  }
+
+  // If scoring failed (degenerate cues), fall back to a padded seed range.
+  if (!Number.isFinite(best.score) || best.score === Number.NEGATIVE_INFINITY) {
+    let startIndex = Math.max(0, Math.min(seedStart, seedEnd));
+    let endIndex = Math.max(startIndex, Math.max(seedStart, seedEnd));
+    while (cues[endIndex].endSeconds - cues[startIndex].startSeconds < MIN_CLIP_SECONDS && endIndex < cues.length - 1) {
+      endIndex += 1;
+    }
+    while (cues[endIndex].endSeconds - cues[startIndex].startSeconds > MAX_CLIP_SECONDS && endIndex > startIndex) {
+      endIndex -= 1;
+    }
+    best = { startIndex, endIndex, score: 0 };
+  }
+
+  // Final pass: if the chosen end is mid-sentence, stretch to the next full stop
+  // when that still keeps us inside the max duration.
+  let { startIndex, endIndex } = best;
+  const currentExcerpt = excerptFromCues(cues, startIndex, endIndex);
+  if (!endsCompleteThought(currentExcerpt) && !endsCompleteThought(cues[endIndex]?.text ?? "")) {
+    for (let probe = endIndex + 1; probe < Math.min(cues.length, endIndex + 12); probe += 1) {
+      const duration = cues[probe].endSeconds - cues[startIndex].startSeconds;
+      if (duration > MAX_CLIP_SECONDS) break;
+      endIndex = probe;
+      if (endsCompleteThought(cues[probe].text) || endsCompleteThought(excerptFromCues(cues, startIndex, probe))) {
+        break;
+      }
+    }
+  }
+
+  // If the opening cue is a weak continuation, try nudging forward a cue or two.
+  for (let probe = 0; probe < 3; probe += 1) {
+    const startText = normalizeSpeech(cues[startIndex]?.text ?? "");
+    if (!WEAK_OPENER_RE.test(startText)) break;
+    if (startIndex >= endIndex) break;
+    const nextDuration = cues[endIndex].endSeconds - cues[startIndex + 1].startSeconds;
+    if (nextDuration < MIN_CLIP_SECONDS) break;
+    startIndex += 1;
+  }
+
+  return {
+    startSeconds: cues[startIndex].startSeconds,
+    endSeconds: cues[endIndex].endSeconds,
+    startIndex,
+    endIndex,
+  };
+};
+
+const deriveClipTimingFromWindows = (candidate: AICandidate, windows: TranscriptWindow[]) => {
   if (windows.length === 0) {
-    const endSeconds = Math.max(candidate.endSeconds, candidate.startSeconds + 15);
+    const startSeconds = Math.max(0, candidate.startSeconds);
+    const endSeconds = Math.max(startSeconds + MIN_CLIP_SECONDS, candidate.endSeconds);
     return {
-      startSeconds: candidate.startSeconds,
+      startSeconds,
       endSeconds,
-      durationSeconds: endSeconds - candidate.startSeconds,
+      durationSeconds: endSeconds - startSeconds,
       transcriptExcerpt: candidate.hook,
     };
   }
@@ -270,35 +566,131 @@ const deriveClipTiming = (candidate: AICandidate, windows: TranscriptWindow[]) =
     [startIndex, endIndex] = [endIndex, startIndex];
   }
 
-  let startSeconds = Math.min(candidate.startSeconds, windows[startIndex].startSeconds);
-  let endSeconds = Math.max(candidate.endSeconds, windows[endIndex].endSeconds);
+  // Prefer opening at the window that contains the hook, and closing only after
+  // a window whose text finishes a thought.
+  let startSeconds = windows[startIndex].startSeconds;
+  let endSeconds = windows[endIndex].endSeconds;
 
-  while (endSeconds - startSeconds < 18 && endIndex < windows.length - 1) {
+  const expandForMin = () => {
+    while (endSeconds - startSeconds < MIN_CLIP_SECONDS && endIndex < windows.length - 1) {
+      endIndex += 1;
+      endSeconds = windows[endIndex].endSeconds;
+    }
+    while (endSeconds - startSeconds < MIN_CLIP_SECONDS && startIndex > 0) {
+      startIndex -= 1;
+      startSeconds = windows[startIndex].startSeconds;
+    }
+  };
+
+  expandForMin();
+
+  // Stretch the end until the joined excerpt ends on punctuation, when possible.
+  while (
+    endIndex < windows.length - 1 &&
+    endSeconds - startSeconds < MAX_CLIP_SECONDS &&
+    !endsCompleteThought(windows[endIndex].text) &&
+    !endsCompleteThought(
+      windows
+        .slice(startIndex, endIndex + 1)
+        .map((window) => window.text)
+        .join(" "),
+    )
+  ) {
     endIndex += 1;
     endSeconds = windows[endIndex].endSeconds;
   }
 
-  while (endSeconds - startSeconds < 18 && startIndex > 0) {
-    startIndex -= 1;
+  while (endSeconds - startSeconds > MAX_CLIP_SECONDS && endIndex > startIndex) {
+    // Shrink from the side that keeps a sentence-final ending when possible.
+    const shrinkEnd = endIndex - 1;
+    const shrunkEnd = windows[shrinkEnd].endSeconds;
+    if (shrunkEnd - startSeconds >= MIN_CLIP_SECONDS) {
+      endIndex = shrinkEnd;
+      endSeconds = shrunkEnd;
+      continue;
+    }
+    break;
+  }
+
+  // Avoid weak openers when the next window is still inside the idea.
+  while (
+    startIndex < endIndex &&
+    WEAK_OPENER_RE.test(normalizeSpeech(windows[startIndex].text)) &&
+    endSeconds - windows[startIndex + 1].startSeconds >= MIN_CLIP_SECONDS
+  ) {
+    startIndex += 1;
     startSeconds = windows[startIndex].startSeconds;
   }
 
-  while (endSeconds - startSeconds > 70 && endIndex > startIndex) {
-    endIndex -= 1;
-    endSeconds = Math.max(candidate.endSeconds, windows[endIndex].endSeconds);
-  }
-
-  const transcriptExcerpt = windows
-    .slice(startIndex, endIndex + 1)
-    .map((window) => window.text)
-    .join(" ");
+  const transcriptExcerpt = normalizeSpeech(
+    windows
+      .slice(startIndex, endIndex + 1)
+      .map((window) => window.text)
+      .join(" "),
+  );
 
   return {
     startSeconds,
     endSeconds,
     durationSeconds: endSeconds - startSeconds,
-    transcriptExcerpt,
+    transcriptExcerpt: transcriptExcerpt || candidate.hook,
   };
+};
+
+const deriveClipTiming = (
+  candidate: AICandidate,
+  windows: TranscriptWindow[],
+  cues: TranscriptCue[] = [],
+) => {
+  const targetStart = Math.max(0, candidate.startSeconds);
+  const targetEnd = Math.max(targetStart + MIN_CLIP_SECONDS, candidate.endSeconds);
+
+  if (cues.length > 0) {
+    const snapped = snapRangeToSpeechBoundaries(cues, targetStart, targetEnd);
+    const transcriptExcerpt =
+      snapped.startIndex >= 0 && snapped.endIndex >= snapped.startIndex
+        ? excerptFromCues(cues, snapped.startIndex, snapped.endIndex)
+        : candidate.hook;
+
+    return {
+      startSeconds: Number(snapped.startSeconds.toFixed(2)),
+      endSeconds: Number(snapped.endSeconds.toFixed(2)),
+      durationSeconds: Number((snapped.endSeconds - snapped.startSeconds).toFixed(2)),
+      transcriptExcerpt: transcriptExcerpt || candidate.hook,
+    };
+  }
+
+  return deriveClipTimingFromWindows(
+    { ...candidate, startSeconds: targetStart, endSeconds: targetEnd },
+    windows,
+  );
+};
+
+/** Drop overlapping weaker clips so the board doesn't repeat the same moment. */
+const dedupeCandidates = (candidates: AICandidate[], maxClips: number): AICandidate[] => {
+  const ranked = [...candidates].sort((a, b) => {
+    const scoreDelta = (Number(b.score) || 0) - (Number(a.score) || 0);
+    if (scoreDelta !== 0) return scoreDelta;
+    return a.startSeconds - b.startSeconds;
+  });
+
+  const accepted: AICandidate[] = [];
+  for (const candidate of ranked) {
+    const overlaps = accepted.some((other) => {
+      const overlapStart = Math.max(candidate.startSeconds, other.startSeconds);
+      const overlapEnd = Math.min(candidate.endSeconds, other.endSeconds);
+      const overlap = Math.max(0, overlapEnd - overlapStart);
+      const shorter = Math.max(
+        1,
+        Math.min(candidate.endSeconds - candidate.startSeconds, other.endSeconds - other.startSeconds),
+      );
+      return overlap / shorter > 0.45;
+    });
+    if (!overlaps) accepted.push(candidate);
+    if (accepted.length >= maxClips) break;
+  }
+
+  return accepted.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
 };
 
 const getVideoId = (url: string) => {
@@ -360,11 +752,50 @@ const buildPrompt = (
   clipCount = 3,
 ) => {
   const transcript = windows
-    .map((window, index) => `${index + 1}. ${formatTime(window.startSeconds)}-${formatTime(window.endSeconds)} | ${window.text}`)
+    .map((window, index) => `${index + 1}. [${formatTime(window.startSeconds)} → ${formatTime(window.endSeconds)}] ${window.text}`)
     .join("\n");
   const count = Math.max(1, Math.min(12, Math.floor(clipCount) || 3));
 
-  return `You are ranking viral short-form clip candidates from a ${sourceLabel}.\n\nVideo title: ${meta?.title ?? "Unknown"}\nChannel: ${meta?.author ?? "Unknown"}\nDuration: ${meta?.durationSeconds ? formatTime(meta.durationSeconds) : "unknown"}\n\nRules:\n- Pick exactly the ${count} best standalone clips.\n- Return exactly ${count} items in the clips array — no fewer, no more.\n- Determine natural clip lengths from the content itself; do not force a fixed duration.\n- Never cut off setup, payoff, or the final key sentence.\n- Favor strong hooks, tension, surprise, emotional payoff, concrete lessons, disagreement potential, and replay value.\n- Keep clips between 15 and 70 seconds when possible.\n- Prefer moments spread across the timeline rather than clustering near the start.\n- Rank by viral potential: highest score first.\n- Return valid JSON only in this exact shape:\n{\n  "clips": [\n    {\n      "title": "...",\n      "hook": "...",\n      "reason": "...",\n      "startSeconds": 0,\n      "endSeconds": 0,\n      "score": 0\n    }\n  ]\n}\n\nTimeline windows:\n${transcript}`;
+  return `You are a short-form clip editor ranking the best standalone moments from a ${sourceLabel}.
+
+Video title: ${meta?.title ?? "Unknown"}
+Channel: ${meta?.author ?? "Unknown"}
+Duration: ${meta?.durationSeconds ? formatTime(meta.durationSeconds) : "unknown"}
+
+Your job is NOT to force fixed timers. Your job is to cut clean, complete moments that feel intentional when watched alone.
+
+Hard rules for every clip:
+- Pick exactly ${count} clips. Return exactly ${count} items in the clips array.
+- Each clip MUST be a self-contained story beat: setup → tension/turn → payoff.
+- startSeconds MUST land at the beginning of a fresh thought or sentence — never mid-sentence, never on a filler continuation like "and", "but", "so", "because".
+- endSeconds MUST land AFTER the final key sentence fully finishes — include the closing word and punctuation beat. Never stop mid-clause or before the punchline lands.
+- Prefer ending on a period, question mark, exclamation, laugh, or clear pause — not a comma or trailing "and/so/but".
+- Ideal length is ${IDEAL_MIN_CLIP_SECONDS}-${IDEAL_MAX_CLIP_SECONDS}s. Hard bounds: ${MIN_CLIP_SECONDS}-${MAX_CLIP_SECONDS}s. Stretch or shrink to protect complete sentences.
+- If a strong idea needs 40s to finish cleanly, use 40s. If it lands in 24s, stop there.
+- Use ONLY timestamps that appear in the timeline windows below (or clearly inside those ranges). Do not invent times far outside the provided windows.
+- Prefer moments spread across the full timeline, not clustered in the first two minutes.
+- Rank by viral potential (hook strength, surprise, emotion, concrete lesson, disagreement, replay value). Highest score first.
+- title: short editorial label for the moment.
+- hook: the exact opening line or promise the viewer hears first.
+- reason: one sentence on why this cut works as a standalone short.
+- score: integer 1-99.
+
+Return valid JSON only in this exact shape:
+{
+  "clips": [
+    {
+      "title": "...",
+      "hook": "...",
+      "reason": "...",
+      "startSeconds": 0,
+      "endSeconds": 0,
+      "score": 0
+    }
+  ]
+}
+
+Timeline windows (use these speech boundaries):
+${transcript}`;
 };
 
 // When the user only has a local file (no YouTube captions), build evenly
@@ -423,7 +854,7 @@ const readUploadedVideoMeta = (file: File): Promise<VideoMeta> =>
     video.src = objectUrl;
   });
 
-async function fetchYouTubeTranscript(videoId: string): Promise<TranscriptWindow[] | null> {
+async function fetchYouTubeTranscript(videoId: string): Promise<TranscriptBundle | null> {
   if (!videoId) return null;
 
   try {
@@ -435,27 +866,91 @@ async function fetchYouTubeTranscript(videoId: string): Promise<TranscriptWindow
     if (!response.ok) return null;
 
     const data = await response.json();
-    if (Array.isArray(data.windows) && data.windows.length > 0) {
-      return data.windows as TranscriptWindow[];
-    }
-    return null;
+    const windows = Array.isArray(data.windows) ? (data.windows as TranscriptWindow[]) : [];
+    const cues = Array.isArray(data.cues)
+      ? (data.cues as TranscriptCue[])
+          .filter(
+            (cue) =>
+              typeof cue.text === "string" &&
+              Number.isFinite(Number(cue.startSeconds)) &&
+              Number.isFinite(Number(cue.endSeconds)) &&
+              Number(cue.endSeconds) > Number(cue.startSeconds),
+          )
+          .map((cue) => ({
+            startSeconds: Number(cue.startSeconds),
+            endSeconds: Number(cue.endSeconds),
+            text: normalizeSpeech(cue.text),
+          }))
+      : [];
+
+    if (windows.length === 0 && cues.length === 0) return null;
+
+    // If the API only returned cues (or windows failed grouping), rebuild
+    // coarse windows client-side so the prompt still has readable chunks.
+    const resolvedWindows =
+      windows.length > 0
+        ? windows.map((window) => ({
+            startSeconds: Number(window.startSeconds),
+            endSeconds: Number(window.endSeconds),
+            text: normalizeSpeech(window.text),
+          }))
+        : buildWindowsFromCues(cues);
+
+    return { windows: resolvedWindows, cues };
   } catch {
     return null;
   }
 }
 
-// Full-length transcripts can run for hours; capped, evenly-spaced sampling
-// keeps the prompt a sane size while still giving the AI visibility into the
-// beginning, middle, and end of the video instead of only its first chunk.
+/** Coarse prompt windows from fine cues when the API only returns cues. */
+const buildWindowsFromCues = (cues: TranscriptCue[], targetSeconds = 28): TranscriptWindow[] => {
+  if (cues.length === 0) return [];
+  const windows: TranscriptWindow[] = [];
+  let startIndex = 0;
+
+  for (let index = 0; index < cues.length; index += 1) {
+    const span = cues[index].endSeconds - cues[startIndex].startSeconds;
+    const atEnd = index === cues.length - 1;
+    const atSentence = endsCompleteThought(cues[index].text);
+    if ((span >= targetSeconds && atSentence) || span >= 48 || atEnd) {
+      windows.push({
+        startSeconds: cues[startIndex].startSeconds,
+        endSeconds: cues[index].endSeconds,
+        text: excerptFromCues(cues, startIndex, index),
+      });
+      startIndex = index + 1;
+    }
+  }
+
+  return windows.filter((window) => window.text && window.endSeconds > window.startSeconds);
+};
+
+// Full-length transcripts can run for hours; capped, density-aware sampling
+// keeps the prompt a sane size while still covering beginning, middle, and end
+// and preserving local sentence context around each kept window.
 const sampleWindowsAcrossTimeline = (windows: TranscriptWindow[], maxCount: number): TranscriptWindow[] => {
   if (windows.length <= maxCount) return windows;
-  const step = windows.length / maxCount;
+
   const sampled: TranscriptWindow[] = [];
-  for (let i = 0; i < maxCount; i += 1) {
-    sampled.push(windows[Math.floor(i * step)]);
+  const used = new Set<number>();
+
+  // Always keep the first and last windows for cold-open / closer coverage.
+  const anchors = [0, windows.length - 1];
+  for (let i = 1; i < maxCount - 1; i += 1) {
+    anchors.push(Math.round((i / (maxCount - 1)) * (windows.length - 1)));
   }
-  return sampled;
+
+  for (const index of anchors) {
+    const safeIndex = Math.max(0, Math.min(windows.length - 1, index));
+    if (used.has(safeIndex)) continue;
+    used.add(safeIndex);
+    sampled.push(windows[safeIndex]);
+    if (sampled.length >= maxCount) break;
+  }
+
+  return sampled.sort((a, b) => a.startSeconds - b.startSeconds);
 };
+
 
 async function fetchYouTubeMeta(videoId: string): Promise<VideoMeta | null> {
   if (!videoId) return null;
@@ -490,18 +985,50 @@ const parseAIClipPayload = (raw: string, maxClips = 12): AICandidate[] | null =>
   try {
     const parsed = JSON.parse(jsonCandidate) as { clips?: AICandidate[] };
     if (!Array.isArray(parsed.clips)) return null;
-    return parsed.clips
+
+    const normalized = parsed.clips
       .filter((clip) => typeof clip.title === "string" && typeof clip.hook === "string")
-      .map((clip) => ({
-        title: clip.title,
-        hook: clip.hook,
-        reason: clip.reason,
-        startSeconds: Number(clip.startSeconds),
-        endSeconds: Number(clip.endSeconds),
-        score: Number(clip.score),
-      }))
-      .filter((clip) => Number.isFinite(clip.startSeconds) && Number.isFinite(clip.endSeconds) && clip.endSeconds > clip.startSeconds)
-      .slice(0, limit);
+      .map((clip) => {
+        const startSeconds = Number(clip.startSeconds);
+        const endSeconds = Number(clip.endSeconds);
+        const score = Number(clip.score);
+        return {
+          title: normalizeSpeech(clip.title),
+          hook: normalizeSpeech(clip.hook),
+          reason: typeof clip.reason === "string" && clip.reason.trim()
+            ? normalizeSpeech(clip.reason)
+            : "Strong standalone moment with a clear hook and payoff.",
+          startSeconds,
+          endSeconds,
+          score: Number.isFinite(score) ? score : 80,
+        } satisfies AICandidate;
+      })
+      .filter((clip) =>
+        Number.isFinite(clip.startSeconds) &&
+        Number.isFinite(clip.endSeconds) &&
+        clip.endSeconds > clip.startSeconds &&
+        clip.title.length > 0 &&
+        clip.hook.length > 0,
+      )
+      // Reject absurd ultra-short or multi-minute AI mistakes before snap.
+      .filter((clip) => {
+        const duration = clip.endSeconds - clip.startSeconds;
+        return duration >= 8 && duration <= 120;
+      })
+      .map((clip) => {
+        // Soft-clamp outrageous lengths; sentence snap refines further.
+        const duration = clip.endSeconds - clip.startSeconds;
+        if (duration < MIN_CLIP_SECONDS) {
+          return { ...clip, endSeconds: clip.startSeconds + MIN_CLIP_SECONDS };
+        }
+        if (duration > MAX_CLIP_SECONDS + 20) {
+          return { ...clip, endSeconds: clip.startSeconds + MAX_CLIP_SECONDS };
+        }
+        return clip;
+      });
+
+    if (normalized.length === 0) return null;
+    return dedupeCandidates(normalized, limit);
   } catch {
     return null;
   }
@@ -586,23 +1113,82 @@ export default function App() {
     setError("");
   };
 
-  const buildClipCards = (candidates: AICandidate[], timingWindows: TranscriptWindow[]) => {
-    return candidates.map((candidate, index) => {
-      const timing = deriveClipTiming(candidate, timingWindows);
+  const buildClipCards = (
+    candidates: AICandidate[],
+    timingWindows: TranscriptWindow[],
+    timingCues: TranscriptCue[] = [],
+  ) => {
+    const cards = candidates.map((candidate) => {
+      const timing = deriveClipTiming(candidate, timingWindows, timingCues);
       return {
-        id: index + 1,
+        id: 0,
         title: candidate.title,
         hook: candidate.hook,
         reason: candidate.reason,
         startSeconds: timing.startSeconds,
         endSeconds: timing.endSeconds,
         durationSeconds: timing.durationSeconds,
-        score: Math.max(1, Math.min(99, Math.round(candidate.score))),
+        originalStartSeconds: timing.startSeconds,
+        originalEndSeconds: timing.endSeconds,
+        score: Math.max(1, Math.min(99, Math.round(Number(candidate.score) || 80))),
         format: getFormatForPlatform(platform),
         captionStyle: getCaptionLabel(captionPreset),
         transcriptExcerpt: timing.transcriptExcerpt,
       } satisfies Clip;
     });
+
+    // Re-dedupe after boundary snap in case two AI picks collapsed onto the same beat.
+    const accepted: Clip[] = [];
+    for (const card of cards.sort((a, b) => b.score - a.score)) {
+      const overlaps = accepted.some((other) => {
+        const overlapStart = Math.max(card.startSeconds, other.startSeconds);
+        const overlapEnd = Math.min(card.endSeconds, other.endSeconds);
+        const overlap = Math.max(0, overlapEnd - overlapStart);
+        const shorter = Math.max(1, Math.min(card.durationSeconds, other.durationSeconds));
+        return overlap / shorter > 0.5;
+      });
+      if (!overlaps) accepted.push(card);
+    }
+
+    return accepted
+      .sort((a, b) => b.score - a.score)
+      .map((clip, index) => ({ ...clip, id: index + 1 }));
+  };
+
+  const mediaDurationSeconds = videoMeta?.durationSeconds;
+
+  const updateClipTiming = (clipId: number, nextStart: number, nextEnd: number) => {
+    setClips((previous) =>
+      previous.map((clip) => {
+        if (clip.id !== clipId) return clip;
+        const range = clampClipRange(nextStart, nextEnd, mediaDurationSeconds);
+        return {
+          ...clip,
+          startSeconds: range.startSeconds,
+          endSeconds: range.endSeconds,
+          durationSeconds: range.durationSeconds,
+        };
+      }),
+    );
+  };
+
+  const resetClipTiming = (clipId: number) => {
+    setClips((previous) =>
+      previous.map((clip) => {
+        if (clip.id !== clipId) return clip;
+        const range = clampClipRange(
+          clip.originalStartSeconds,
+          clip.originalEndSeconds,
+          mediaDurationSeconds,
+        );
+        return {
+          ...clip,
+          startSeconds: range.startSeconds,
+          endSeconds: range.endSeconds,
+          durationSeconds: range.durationSeconds,
+        };
+      }),
+    );
   };
 
   const handleDownloadClipBrief = (clip: Clip) => {
@@ -623,13 +1209,19 @@ export default function App() {
         startSeconds: clip.startSeconds,
         endSeconds: clip.endSeconds,
         durationSeconds: clip.durationSeconds,
+        originalStartSeconds: clip.originalStartSeconds,
+        originalEndSeconds: clip.originalEndSeconds,
         start: formatTime(clip.startSeconds),
         end: formatTime(clip.endSeconds),
         duration: formatTime(clip.durationSeconds),
         score: clip.score,
         format: clip.format,
+        aspect: aspectFromFormat(clip.format),
         captionStyle: clip.captionStyle,
         transcriptExcerpt: clip.transcriptExcerpt,
+        manuallyTrimmed:
+          Math.abs(clip.startSeconds - clip.originalStartSeconds) > 0.05 ||
+          Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05,
         previewUrl: currentVideoId ? getClipEmbedUrl(currentVideoId, clip) : null,
         youtubeUrl: currentVideoId
           ? `https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`
@@ -668,6 +1260,7 @@ export default function App() {
         file: uploadedFile,
         startSeconds: clip.startSeconds,
         endSeconds: clip.endSeconds,
+        aspect: aspectFromFormat(clip.format),
         onStatus: (message) => {
           setUploadRenderStatus((prev) => ({ ...prev, [clip.id]: message }));
         },
@@ -727,6 +1320,7 @@ export default function App() {
           url: youtubeUrl,
           startSeconds: clip.startSeconds,
           endSeconds: clip.endSeconds,
+          aspect: aspectFromFormat(clip.format),
         }),
       });
 
@@ -801,11 +1395,12 @@ export default function App() {
 
         setStageIndex(4);
         await new Promise((resolve) => window.setTimeout(resolve, 350));
-        setClips(buildClipCards(candidates, timingWindows));
+        const built = buildClipCards(candidates, timingWindows);
+        setClips(built);
         setAiSummary(
           parsed?.length
-            ? `Claude Sonnet 5 scored the uploaded video's timeline and returned ${candidates.length} clip${candidates.length === 1 ? "" : "s"} with flexible lengths so each cut ends on a full idea. No YouTube link was needed.`
-            : `AI scaffolding is active, and the UI fell back to ${candidates.length} local timeline moment${candidates.length === 1 ? "" : "s"} from your uploaded file because a structured response was not available for this run.`,
+            ? `Claude Sonnet 5 scored the uploaded video's timeline and returned ${built.length} clip${built.length === 1 ? "" : "s"} sized to complete thoughts. Upload-only mode has no captions, so boundaries follow timeline windows — add a YouTube link with captions for sentence-perfect cuts.`
+            : `AI scaffolding is active, and the UI fell back to ${built.length} local timeline moment${built.length === 1 ? "" : "s"} from your uploaded file because a structured response was not available for this run.`,
         );
         return;
       }
@@ -814,11 +1409,14 @@ export default function App() {
       setVideoMeta(meta);
       setStageIndex(1);
 
-      setAiSummary("Fetching this video's real captions so AI scores actual content instead of samples...");
+      setAiSummary("Fetching this video's real captions so AI scores actual speech and cuts on full sentences...");
       const realTranscript = await fetchYouTubeTranscript(currentVideoId);
-      const usedRealTranscript = Boolean(realTranscript?.length);
+      const usedRealTranscript = Boolean(realTranscript?.windows.length);
+      const fullWindows = usedRealTranscript ? realTranscript!.windows : SAMPLE_WINDOWS;
+      const fullCues = usedRealTranscript ? realTranscript!.cues : [];
+      // More windows = better moment diversity; cues stay available for snap.
       const transcriptWindows = usedRealTranscript
-        ? sampleWindowsAcrossTimeline(realTranscript as TranscriptWindow[], 80)
+        ? sampleWindowsAcrossTimeline(fullWindows, 100)
         : SAMPLE_WINDOWS;
       setStageIndex(2);
 
@@ -830,16 +1428,20 @@ export default function App() {
       const candidates = parsed?.length ? parsed : buildFallbackCandidates(clipCount);
       // Fallback candidates carry timestamps written against SAMPLE_WINDOWS;
       // only time real AI picks against the (possibly real) transcript windows.
-      const timingWindows = parsed?.length ? transcriptWindows : SAMPLE_WINDOWS;
+      // Use the FULL cue list for snapping so edges can land on exact sentences
+      // even when the prompt only saw a sampled subset of windows.
+      const timingWindows = parsed?.length ? (usedRealTranscript ? fullWindows : transcriptWindows) : SAMPLE_WINDOWS;
+      const snapCues = parsed?.length && usedRealTranscript ? fullCues : [];
 
       setStageIndex(4);
       await new Promise((resolve) => window.setTimeout(resolve, 350));
-      setClips(buildClipCards(candidates, timingWindows));
+      const built = buildClipCards(candidates, timingWindows, snapCues);
+      setClips(built);
       setAiSummary(parsed?.length
         ? usedRealTranscript
-          ? `Claude Sonnet 5 scored this video's real transcript and returned ${candidates.length} clip${candidates.length === 1 ? "" : "s"} with flexible lengths so each cut ends on a full idea.`
-          : `No captions were available for this video, so Claude Sonnet 5 scored representative sample windows and returned ${candidates.length} clip${candidates.length === 1 ? "" : "s"}.`
-        : `AI scaffolding is active, and the UI fell back to ${candidates.length} local sample moment${candidates.length === 1 ? "" : "s"} because a structured response was not available for this run.`);
+          ? `Claude Sonnet 5 scored this video's real transcript and returned ${built.length} clip${built.length === 1 ? "" : "s"}. Each range was snapped onto caption cues so cuts open on a fresh thought and close after a finished sentence.`
+          : `No captions were available for this video, so Claude Sonnet 5 scored representative sample windows and returned ${built.length} clip${built.length === 1 ? "" : "s"}.`
+        : `AI scaffolding is active, and the UI fell back to ${built.length} local sample moment${built.length === 1 ? "" : "s"} because a structured response was not available for this run.`);
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "The local analysis run failed.");
     } finally {
@@ -906,7 +1508,7 @@ export default function App() {
                   Find <span className="text-primary">viral moments</span> from a link or an uploaded video.
                 </h1>
                 <p className="max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-                  Paste a YouTube URL or upload a video file you own. AI ranks the best complete moments, sizes each clip to the payoff, and lets you preview and download without forcing both inputs.
+                  Paste a YouTube URL or upload a video file you own. AI ranks the best complete moments, sizes each clip to the payoff, and lets you manually trim start/end times before exporting a 9:16 Shorts frame.
                 </p>
               </div>
 
@@ -1277,186 +1879,46 @@ export default function App() {
                                 <h3 className="text-lg font-semibold tracking-tight">{clip.title}</h3>
                                 <p className="mt-1 text-sm text-muted-foreground">
                                   {formatTime(clip.startSeconds)} → {formatTime(clip.endSeconds)} · {formatTime(clip.durationSeconds)}
+                                  {(Math.abs(clip.startSeconds - clip.originalStartSeconds) > 0.05 ||
+                                    Math.abs(clip.endSeconds - clip.originalEndSeconds) > 0.05) && (
+                                    <span className="ml-1.5 text-primary">· edited</span>
+                                  )}
                                 </p>
                               </div>
                               <PlayCircle className="mt-1 size-5 text-primary" />
                             </div>
                             <p className="text-sm leading-6 text-muted-foreground">{clip.reason}</p>
-                            <Separator />
                             <div className="flex items-center justify-between text-sm">
                               <span className="text-muted-foreground">Caption preset</span>
                               <span className="font-medium">{clip.captionStyle}</span>
                             </div>
-                            <Dialog>
-                              <DialogTrigger asChild>
-                                <Button
-                                  variant="outline"
-                                  className="h-11 w-full rounded-2xl border-border/70 bg-background/70"
-                                >
-                                  Preview render
-                                  <ArrowRight className="size-4" />
-                                </Button>
-                              </DialogTrigger>
-                              <DialogContent className="max-h-[85vh] w-full max-w-3xl sm:max-w-3xl overflow-y-auto rounded-[28px] border-border/70 p-0">
-                                <DialogHeader className="border-b border-border/70 px-6 py-5 text-left">
-                                  <DialogTitle className="text-xl tracking-tight">{clip.title}</DialogTitle>
-                                  <DialogDescription>
-                                    {videoMeta?.title ?? uploadedFile?.name ?? "Clip preview"} · {formatTime(clip.startSeconds)} to {formatTime(clip.endSeconds)} · auto-fit duration {formatTime(clip.durationSeconds)}
-                                  </DialogDescription>
-                                </DialogHeader>
-                                <div>
-                                    <div className="aspect-video w-full bg-black">
-                                        {currentVideoId ? (
-                                          <iframe
-                                            key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}`}
-                                            src={getClipEmbedUrl(currentVideoId, clip)}
-                                            title={clip.title}
-                                            className="h-full w-full"
-                                            loading="lazy"
-                                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                                            referrerPolicy="strict-origin-when-cross-origin"
-                                            allowFullScreen
-                                          />
-                                        ) : uploadedPreviewUrl ? (
-                                          <video
-                                            key={`${clip.id}-${clip.startSeconds}-${clip.endSeconds}-local`}
-                                            src={`${uploadedPreviewUrl}#t=${Math.max(0, Math.floor(clip.startSeconds))},${Math.max(Math.ceil(clip.endSeconds), Math.floor(clip.startSeconds) + 1)}`}
-                                            className="h-full w-full"
-                                            controls
-                                            playsInline
-                                            preload="metadata"
-                                          />
-                                        ) : (
-                                          <div className="flex h-full w-full items-center justify-center text-white/70">Upload a video or add a YouTube link to preview this clip.</div>
-                                        )}
-                                    </div>
-                                    <div className="bg-background">
-                                      <div className="space-y-4 px-6 py-5">
-                                        <div>
-                                          <p className="text-sm font-medium text-muted-foreground">Why AI picked this</p>
-                                          <p className="mt-2 text-sm leading-6">{clip.reason}</p>
-                                        </div>
-                                        <div>
-                                          <p className="text-sm font-medium text-muted-foreground">Transcript excerpt used for sizing</p>
-                                          <p className="mt-2 text-sm leading-6 text-muted-foreground">{clip.transcriptExcerpt}</p>
-                                        </div>
-                                        <div className="grid grid-cols-2 gap-3 text-sm">
-                                          <div className="rounded-2xl border border-border/70 bg-card p-4">
-                                            <p className="text-muted-foreground">Start</p>
-                                            <p className="mt-1 font-semibold">{formatTime(clip.startSeconds)}</p>
-                                          </div>
-                                          <div className="rounded-2xl border border-border/70 bg-card p-4">
-                                            <p className="text-muted-foreground">End</p>
-                                            <p className="mt-1 font-semibold">{formatTime(clip.endSeconds)}</p>
-                                          </div>
-                                          <div className="rounded-2xl border border-border/70 bg-card p-4">
-                                            <p className="text-muted-foreground">Duration</p>
-                                            <p className="mt-1 font-semibold">{formatTime(clip.durationSeconds)}</p>
-                                          </div>
-                                          <div className="rounded-2xl border border-border/70 bg-card p-4">
-                                            <p className="text-muted-foreground">Score</p>
-                                            <p className="mt-1 font-semibold">{clip.score}/99</p>
-                                          </div>
-                                        </div>
-                                        <div className="rounded-2xl border border-primary/15 bg-primary/6 p-4 text-sm text-muted-foreground">
-                                          {currentVideoId
-                                            ? "This preview uses a real YouTube embed with exact start and end parameters."
-                                            : uploadedFile
-                                              ? "This preview plays your uploaded file locally. No YouTube link is required to review or download the cut."
-                                              : "Add a YouTube link or upload a video file to preview this clip."}
-                                        </div>
-                                      </div>
-                                      <div className="border-t border-border/70 bg-background/95 px-6 py-4">
-                                        <div className="flex flex-col gap-3 sm:flex-row">
-                                          <Button
-                                            className="h-11 flex-1 rounded-2xl"
-                                            onClick={() => handleRenderClip(clip)}
-                                            disabled={renderState[clip.id] === "rendering" || uploadRenderState[clip.id] === "rendering" || (!uploadedFile && !hasYouTubeLink)}
-                                          >
-                                            {renderState[clip.id] === "rendering" || uploadRenderState[clip.id] === "rendering" ? (
-                                              <span className="inline-flex items-center gap-2">
-                                                <LoaderCircle className="size-4 animate-spin" />
-                                                {uploadedFile ? "Trimming in browser…" : "Rendering clip…"}
-                                              </span>
-                                            ) : uploadedFile ? (
-                                              <span className="inline-flex items-center gap-2">
-                                                <Scissors className="size-4" />
-                                                Trim locally & download
-                                              </span>
-                                            ) : (
-                                              "Render & download clip"
-                                            )}
-                                          </Button>
-                                          {currentVideoId ? (
-                                            <Button asChild variant="outline" className="h-11 flex-1 rounded-2xl border-border/70 bg-background/80">
-                                              <a href={`https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(clip.startSeconds)}s`} target="_blank" rel="noreferrer noopener">
-                                                Open on YouTube
-                                              </a>
-                                            </Button>
-                                          ) : null}
-                                        </div>
-
-                                        {renderState[clip.id] === "error" || uploadRenderState[clip.id] === "error" ? (
-                                          <div className="mt-3 flex items-start gap-2 rounded-2xl border border-destructive/20 bg-destructive/10 p-3 text-xs text-destructive">
-                                            <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
-                                            <div>
-                                              <p>{uploadRenderErrors[clip.id] ?? renderErrors[clip.id] ?? "Clip rendering failed."}</p>
-                                              {!uploadedFile ? (
-                                                <button
-                                                  type="button"
-                                                  onClick={() => uploadInputRef.current?.click()}
-                                                  className="mt-1 font-medium underline underline-offset-2"
-                                                >
-                                                  Upload a video file instead
-                                                </button>
-                                              ) : null}
-                                            </div>
-                                          </div>
-                                        ) : uploadRenderState[clip.id] === "rendering" && uploadRenderStatus[clip.id] ? (
-                                          <p className="mt-2 text-xs text-muted-foreground">{uploadRenderStatus[clip.id]}</p>
-                                        ) : (
-                                          <p className="mt-2 text-xs text-muted-foreground">
-                                            {uploadedFile
-                                              ? "Trims in your browser from the local file — large videos are supported, nothing is sent to a server."
-                                              : "Downloads a real cut of the video, re-encoded to this clip's exact start and end time."}
-                                          </p>
-                                        )}
-
-                                        {!uploadedFile && hasYouTubeLink ? (
-                                          <>
-                                            <Separator className="my-4" />
-                                            <div className="flex items-center justify-between gap-3 rounded-2xl border border-dashed border-border/70 bg-background/60 p-3">
-                                              <p className="text-xs leading-5 text-muted-foreground">
-                                                If YouTube blocks the download above, upload your own copy of this video to trim it reliably — no link required after that.
-                                              </p>
-                                              <Button
-                                                type="button"
-                                                variant="outline"
-                                                size="sm"
-                                                className="h-8 shrink-0 rounded-xl border-border/70 bg-background/80 text-xs"
-                                                onClick={() => uploadInputRef.current?.click()}
-                                              >
-                                                <Upload className="mr-1.5 size-3.5" />
-                                                Upload video
-                                              </Button>
-                                            </div>
-                                          </>
-                                        ) : null}
-
-                                        <div className="mt-3 flex items-center justify-end">
-                                          <button
-                                            type="button"
-                                            onClick={() => handleDownloadClipBrief(clip)}
-                                            className="whitespace-nowrap text-xs font-medium text-muted-foreground underline underline-offset-2 hover:text-foreground"
-                                          >
-                                            Clip brief (JSON)
-                                          </button>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  </div>
-                              </DialogContent>
-                            </Dialog>
+                            <ClipPreviewDialog
+                              clip={clip}
+                              videoTitle={videoMeta?.title ?? uploadedFile?.name}
+                              currentVideoId={currentVideoId}
+                              uploadedPreviewUrl={uploadedPreviewUrl}
+                              hasUploadedFile={Boolean(uploadedFile)}
+                              hasYouTubeLink={hasYouTubeLink}
+                              getClipEmbedUrl={getClipEmbedUrl}
+                              formatTime={formatTime}
+                              formatTimePrecise={formatTimePrecise}
+                              parseTimestamp={parseTimestamp}
+                              mediaDurationSeconds={mediaDurationSeconds}
+                              onUpdateTiming={updateClipTiming}
+                              onResetTiming={resetClipTiming}
+                              onRender={handleRenderClip}
+                              onDownloadBrief={handleDownloadClipBrief}
+                              onUploadClick={() => uploadInputRef.current?.click()}
+                              renderState={
+                                renderState[clip.id] === "rendering" || uploadRenderState[clip.id] === "rendering"
+                                  ? "rendering"
+                                  : renderState[clip.id] === "error" || uploadRenderState[clip.id] === "error"
+                                    ? "error"
+                                    : "idle"
+                              }
+                              renderError={uploadRenderErrors[clip.id] ?? renderErrors[clip.id]}
+                              renderStatus={uploadRenderStatus[clip.id]}
+                            />
                           </div>
                         </MagicCard>
                       ))}
